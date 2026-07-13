@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,6 +68,18 @@ def save_ledger(output_root: Path, ledger):
     )
 
 
+def report_progress(**values):
+    """Write a replace-in-place progress snapshot when launched by the Web console."""
+    path = os.environ.get("PROGRESS_PATH")
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(target)
+
+
 def merge_events(event_groups, merge_seconds):
     merged = defaultdict(list)
     for camera, events in event_groups.items():
@@ -120,8 +133,25 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
     last_person = {}
     samples = 0
     inferences = 0
+    estimated_samples = max(1, sum(
+        int((record["end"] - record["start"]).total_seconds() / sample_seconds) for record in records
+    ))
+    started = time.monotonic()
+
+    def update(index, record, offset):
+        elapsed = max(time.monotonic() - started, 0.001)
+        percent = min(99.9, samples / estimated_samples * 100)
+        eta = (elapsed / samples * max(estimated_samples - samples, 0)) if samples else None
+        report_progress(
+            phase="scanning", percent=round(percent, 1), current_file=record["path"].name,
+            file_index=index, total_files=len(records), offset_seconds=round(offset, 1),
+            samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
+            elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta, 1) if eta is not None else None,
+        )
+
     for index, record in enumerate(records, start=1):
         print(f"[{index}/{len(records)}] {record['path'].name}", flush=True)
+        update(index, record, 0)
         capture = cv2.VideoCapture(str(record["path"]))
         if not capture.isOpened():
             print(f"skip unreadable: {record['path']}", file=sys.stderr)
@@ -148,6 +178,8 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
             previous_gray = current_gray
             recently_seen = (moment - last_person.get(record["camera"], datetime.min)).total_seconds() <= keepalive_seconds
             if motion_threshold is not None and not motion and not recently_seen:
+                if samples % 5 == 0:
+                    update(index, record, offset)
                 offset += sample_seconds
                 continue
             inferences += 1
@@ -166,9 +198,16 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
                         "hits": 1,
                         "thumbnail": str(thumbnail.relative_to(output_root)),
                     })
+            if samples % 5 == 0:
+                update(index, record, offset)
             offset += sample_seconds
         capture.release()
     print(f"samples={samples} yolo_inferences={inferences}", flush=True)
+    report_progress(
+        phase="completed", percent=100, file_index=len(records), total_files=len(records),
+        samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
+        elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
+    )
     return dict(events)
 
 
@@ -191,14 +230,20 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     candidates = [record for record in records if record["camera"] == camera]
     if not selected_events:
         raise SystemExit(f"camera {camera} has no events to export")
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="person-timelapse-") as temporary:
         frames_dir = Path(temporary)
         count = 0
         written_moments = set()
-        for record in candidates:
+        for record_index, record in enumerate(candidates, start=1):
             relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
             if not relevant:
                 continue
+            report_progress(
+                phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
+                current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
+                frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None,
+            )
             capture = cv2.VideoCapture(str(record["path"]))
             if not capture.isOpened():
                 continue
@@ -227,6 +272,10 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             "-i", str(frames_dir / "frame-%08d.jpg"), "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "26",
             "-pix_fmt", "yuv420p", str(target),
         ], check=True)
+    report_progress(
+        phase="completed", percent=100, file_index=len(candidates), total_files=len(candidates),
+        frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
+    )
     print(target)
 
 

@@ -24,6 +24,12 @@ TASKS_PATH = OUTPUT_ROOT / "tasks.json"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^\d+$")
 LOCK = threading.Lock()
+PROCESSES = {}
+PROFILES = {
+    "eco": {"label": "节能", "sample_seconds": "10", "motion_threshold": "4"},
+    "balanced": {"label": "平衡", "sample_seconds": "5", "motion_threshold": "3"},
+    "precise": {"label": "精细", "sample_seconds": "2", "motion_threshold": "2"},
+}
 
 
 def read_json(path, fallback):
@@ -46,6 +52,31 @@ def save_tasks(tasks):
     write_json(TASKS_PATH, tasks)
 
 
+def recover_interrupted_tasks():
+    """A process cannot survive a console restart, so do not leave stale running tasks behind."""
+    tasks = load_tasks()
+    changed = False
+    for task in tasks["tasks"]:
+        if task.get("status") == "running":
+            task["status"] = "interrupted"
+            task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            task["detail"] = "管理页或 NAS 重启，任务已中断；可重新创建任务继续。"
+            changed = True
+    if changed:
+        save_tasks(tasks)
+
+
+def public_tasks():
+    tasks = load_tasks()["tasks"][:20]
+    result = []
+    for task in tasks:
+        item = dict(task)
+        if task.get("progress_file"):
+            item["progress"] = read_json(OUTPUT_ROOT / task["progress_file"], {})
+        result.append(item)
+    return result
+
+
 def event_summary(date):
     events = read_json(OUTPUT_ROOT / f"events-{date}.json", {})
     groups = events.get("events", {})
@@ -63,19 +94,25 @@ def available_dates():
     return [event_summary(day) for day in sorted(source_days | result_days, reverse=True)]
 
 
-def task_worker(task_id, command):
+def task_worker(task_id, command, progress_file):
+    environment = os.environ.copy()
+    environment["PROGRESS_PATH"] = str(OUTPUT_ROOT / progress_file)
+    process = None
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-        status = "completed" if result.returncode == 0 else "failed"
-        detail = (result.stdout + result.stderr).strip()[-4000:]
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
+        PROCESSES[task_id] = process
+        detail, _ = process.communicate()
+        status = "completed" if process.returncode == 0 else "failed"
+        detail = detail.strip()[-4000:]
     except Exception as error:  # pragma: no cover - defensive boundary for background work
         status = "failed"
         detail = str(error)
     with LOCK:
+        PROCESSES.pop(task_id, None)
         tasks = load_tasks()
         for task in tasks["tasks"]:
             if task["id"] == task_id:
-                task["status"] = status
+                task["status"] = "cancelled" if task.get("cancel_requested") else status
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 task["detail"] = detail
         save_tasks(tasks)
@@ -87,6 +124,9 @@ def create_task(payload):
     if kind not in {"scan", "export"} or not DATE_PATTERN.fullmatch(date):
         raise ValueError("任务类型或日期无效")
     camera = payload.get("camera", "")
+    profile = payload.get("profile", "balanced")
+    if profile not in PROFILES:
+        raise ValueError("性能档位无效")
     if kind == "export" and not CAMERA_PATTERN.fullmatch(camera):
         raise ValueError("导出任务需要摄像头编号")
     events_path = OUTPUT_ROOT / f"events-{date}.json"
@@ -102,22 +142,41 @@ def create_task(payload):
             "kind": kind,
             "date": date,
             "camera": camera or None,
+            "profile": profile if kind == "scan" else None,
             "status": "running",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "detail": "任务已启动",
         }
+        task["progress_file"] = f"progress-{task['id']}.json"
         tasks["tasks"].insert(0, task)
         save_tasks(tasks)
 
     command = [sys.executable, str(APP_ROOT / "person_timelapse.py")]
     if kind == "scan":
+        settings = PROFILES[profile]
         command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", date,
-                    "--sample-seconds", "5", "--motion-threshold", "3", "--keepalive-seconds", "60"]
+                    "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
+                    "--keepalive-seconds", "60"]
     else:
         command += ["export", str(INPUT_ROOT), str(events_path), str(OUTPUT_ROOT), "--camera", camera]
-    thread = threading.Thread(target=task_worker, args=(task["id"], command), daemon=True)
+    thread = threading.Thread(target=task_worker, args=(task["id"], command, task["progress_file"]), daemon=True)
     thread.start()
     return task
+
+
+def cancel_task(task_id):
+    with LOCK:
+        tasks = load_tasks()
+        task = next((item for item in tasks["tasks"] if item["id"] == task_id), None)
+        if not task or task["status"] != "running":
+            raise ValueError("没有可取消的运行中任务")
+        task["cancel_requested"] = True
+        task["detail"] = "正在停止任务…"
+        save_tasks(tasks)
+        process = PROCESSES.get(task_id)
+        if process:
+            process.terminate()
+    return {"id": task_id, "status": "cancelling"}
 
 
 class ConsoleHandler(SimpleHTTPRequestHandler):
@@ -135,7 +194,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/overview":
-            self.send_json({"dates": available_dates(), "tasks": load_tasks()["tasks"][:20]})
+            self.send_json({"dates": available_dates(), "tasks": public_tasks(), "profiles": PROFILES})
             return
         if path.startswith("/api/date/"):
             date = path.rsplit("/", 1)[-1]
@@ -179,9 +238,20 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         except (ValueError, RuntimeError) as error:
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if not path.startswith("/api/tasks/"):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            self.send_json(cancel_task(path.rsplit("/", 1)[-1]))
+        except ValueError as error:
+            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
 
 def main():
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    recover_interrupted_tasks()
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8790"))), ConsoleHandler)
     print("Person Timelapse Console listening on port 8790")
     server.serve_forever()

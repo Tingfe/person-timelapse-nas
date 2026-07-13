@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import os
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -67,3 +70,18 @@ class FilenameParsingTests(unittest.TestCase):
         summary = MODULE_UNDER_TEST.summarize([])
         self.assertEqual(summary["files"], 0)
         self.assertIsNone(summary["first"])
+
+    def test_progress_snapshot_is_atomic_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "progress-task.json"
+            previous = os.environ.get("PROGRESS_PATH")
+            os.environ["PROGRESS_PATH"] = str(target)
+            try:
+                MODULE_UNDER_TEST.report_progress(phase="scanning", percent=12.5, samples=20)
+            finally:
+                if previous is None:
+                    os.environ.pop("PROGRESS_PATH", None)
+                else:
+                    os.environ["PROGRESS_PATH"] = previous
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["percent"], 12.5)
+            self.assertFalse(target.with_suffix(".tmp").exists())

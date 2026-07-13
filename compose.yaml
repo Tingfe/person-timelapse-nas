@@ -1,0 +1,17 @@
+services:
+  person-timelapse:
+    # ARM64 image for the Z2 Pro. Pin the version so a future image update does
+    # not silently change the first trial.
+    build: .
+    image: person-timelapse:local
+    container_name: person-timelapse
+    working_dir: /app
+    command: ["python", "/app/web_server.py"]
+    volumes:
+      - ./app:/app:ro
+      - /你的/小米录像目录:/input:ro
+      - /你的/人物延时输出目录:/output
+      - ./models:/models
+    ports:
+      - "8790:8790"
+    restart: unless-stopped

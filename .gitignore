@@ -1,0 +1,22 @@
+# Real household footage and all derived personal data
+data/
+output/**
+!output/.gitkeep
+models/**
+!models/.gitkeep
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.log
+
+# Local configuration and operating-system metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+__pycache__/
+*.py[cod]

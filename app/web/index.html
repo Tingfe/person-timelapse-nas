@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>影像档案室</title>
+  <style>
+    :root { --ink:#1e2927; --paper:#f5f1e8; --line:#c5c1b6; --moss:#2d5a4a; --sun:#e56d3e; --muted:#6d746f; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); background:linear-gradient(120deg,#ebe5d8,#f7f4ec 50%,#e8eee5); font:15px/1.5 "Avenir Next","PingFang SC",sans-serif; }
+    body:before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.15; background-image:radial-gradient(#31433c 0.7px,transparent .7px); background-size:7px 7px; }
+    header { position:relative; padding:32px max(24px,calc((100vw - 1240px)/2)); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:end; }
+    .eyebrow { color:var(--moss); font-size:11px; font-weight:800; letter-spacing:.16em; text-transform:uppercase; } h1 { margin:2px 0 0; font:clamp(34px,5vw,62px)/.92 "Iowan Old Style","Palatino Linotype",serif; letter-spacing:-.06em; } .clock { font:12px monospace; color:var(--muted); }
+    main { position:relative; max-width:1240px; margin:0 auto; padding:24px; display:grid; grid-template-columns:minmax(0,1fr) 350px; gap:24px; }
+    .panel { background:rgba(255,255,252,.72); border:1px solid var(--line); box-shadow:5px 6px 0 rgba(48,71,61,.08); } .panel h2 { margin:0; padding:16px 18px; font:700 16px "Iowan Old Style",serif; border-bottom:1px solid var(--line); }
+    .dates { display:grid; grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); gap:1px; background:var(--line); }
+    button.date { padding:16px; text-align:left; border:0; background:var(--paper); cursor:pointer; transition:.18s; } button.date:hover, button.date.active { background:#dbe8de; transform:translate(-2px,-2px); box-shadow:3px 3px 0 var(--moss); } .date strong { display:block; font:600 16px "Iowan Old Style",serif; } .date small { color:var(--muted); }
+    .details { min-height:340px; padding:18px; } .empty { color:var(--muted); padding:45px 0; text-align:center; } .event { display:grid; grid-template-columns:100px 1fr; gap:12px; padding:9px 0; border-bottom:1px dashed var(--line); } .event img { width:100px; height:62px; object-fit:cover; background:#d9d7cf; }
+    aside { display:flex; flex-direction:column; gap:24px; } .form { padding:18px; display:grid; gap:12px; } label { display:grid; gap:5px; color:var(--muted); font-size:12px; font-weight:700; } select { padding:10px; border:1px solid var(--line); background:white; color:var(--ink); } .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; } button.action { border:0; padding:11px; color:white; background:var(--moss); cursor:pointer; font-weight:800; } button.action.export { background:var(--sun); } button:disabled { opacity:.45; cursor:not-allowed; }
+    .tasks { padding:8px 18px 18px; max-height:300px; overflow:auto; } .task { padding:10px 0; border-bottom:1px dashed var(--line); } .task b { font-size:12px; } .tag { padding:2px 6px; border-radius:99px; font-size:10px; background:#e6e6df; } .tag.running { background:#f7d49d; } .tag.completed { background:#b6d9be; } .tag.failed { background:#f2b6a5; }
+    video { width:100%; max-height:340px; background:#17231f; margin:12px 0; } .notice { margin:0 18px 18px; color:var(--sun); font-size:12px; } @media(max-width:800px){ main{grid-template-columns:1fr;} header{align-items:start;flex-direction:column;gap:12px;} }
+  </style>
+</head>
+<body>
+  <header><div><div class="eyebrow">Private archive · local network only</div><h1>影像档案室</h1></div><div class="clock" id="clock"></div></header>
+  <main>
+    <section class="panel"><h2>日期索引</h2><div class="dates" id="dates"></div><div class="details" id="details"><div class="empty">选择一个有录像的日期</div></div></section>
+    <aside>
+      <section class="panel"><h2>新建任务</h2><div class="form"><label>录像日期<select id="dateSelect"></select></label><label>摄像头<select id="cameraSelect"><option value="0">0 路</option><option value="10">10 路</option></select></label><div class="actions"><button class="action" id="scan">扫描人物</button><button class="action export" id="export">制作延时</button></div></div><p class="notice" id="notice">一次只运行一个任务，避免占满 NAS。</p></section>
+      <section class="panel"><h2>任务队列</h2><div class="tasks" id="tasks"></div></section>
+    </aside>
+  </main>
+  <script>
+    let overview={dates:[],tasks:[]}, selected=''; const $=s=>document.querySelector(s);
+    const fmt=d=>`${d.slice(0,4)}.${d.slice(4,6)}.${d.slice(6)}`;
+    async function api(url,opts){ const r=await fetch(url,opts); const d=await r.json(); if(!r.ok) throw Error(d.error||'请求失败'); return d; }
+    async function load(){ overview=await api('/api/overview'); render(); if(selected) showDate(selected); }
+    function render(){ $('#dates').innerHTML=overview.dates.map(d=>`<button class="date ${d.date===selected?'active':''}" data-date="${d.date}"><strong>${fmt(d.date)}</strong><small>${d.ready?`${d.events} 个事件 · ${d.cameras.join('/')} 路`:'待扫描'}</small></button>`).join('')||'<div class="empty">未发现 MP4 录像</div>'; $('#dateSelect').innerHTML=overview.dates.map(d=>`<option value="${d.date}">${fmt(d.date)}</option>`).join(''); $('#tasks').innerHTML=overview.tasks.map(t=>`<div class="task"><b>${t.kind==='scan'?'人物扫描':'延时导出'} · ${fmt(t.date)}${t.camera?' · '+t.camera+'路':''}</b><br><span class="tag ${t.status}">${t.status}</span> <small>${t.created_at}</small></div>`).join('')||'<div class="empty">尚无任务</div>'; document.querySelectorAll('[data-date]').forEach(x=>x.onclick=()=>showDate(x.dataset.date)); }
+    async function showDate(date){ selected=date; render(); const data=await api('/api/date/'+date); const groups=data.events.events||{}; const events=Object.entries(groups).flatMap(([camera,list])=>list.map(e=>({...e,camera}))); const clips=data.exports.map(name=>`<video controls preload="metadata" src="/media/${encodeURIComponent(name)}"></video><small>${name}</small>`).join(''); $('#details').innerHTML=`<h2>${fmt(date)} · 人物事件 ${events.length} 段</h2>${clips||''}<div>${events.map(e=>`<div class="event"><img src="/media/${e.thumbnail}" alt="事件缩略图"><div><b>${e.camera} 路 · ${e.start.slice(11)} — ${e.end.slice(11)}</b><br><small>检测命中 ${e.hits} 次</small></div></div>`).join('')||'<div class="empty">尚未扫描或没有检测到人物</div>'}</div>`; }
+    async function task(kind){ const payload={kind,date:$('#dateSelect').value,camera:$('#cameraSelect').value}; try{ $('#notice').textContent='正在创建任务…'; await api('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); $('#notice').textContent='任务已加入队列，页面会自动刷新状态。'; await load(); }catch(e){ $('#notice').textContent=e.message; } }
+    $('#scan').onclick=()=>task('scan'); $('#export').onclick=()=>task('export'); setInterval(load,8000); load(); setInterval(()=>$('#clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);
+  </script>
+</body>
+</html>

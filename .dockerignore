@@ -1,0 +1,14 @@
+.git
+.DS_Store
+data/
+output/
+models/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.log
+__pycache__/

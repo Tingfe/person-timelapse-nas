@@ -124,7 +124,7 @@ def save_thumbnail(frame, output_root: Path, camera: str, moment: datetime):
 
 
 def scan(records, output_root: Path, sample_seconds: float, confidence: float, merge_seconds: float,
-         motion_threshold: Optional[float] = None, keepalive_seconds: float = 60.0):
+         motion_threshold: Optional[float] = None, keepalive_seconds: float = 60.0, imgsz: int = 640):
     import cv2
     from ultralytics import YOLO
 
@@ -183,7 +183,7 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
                 offset += sample_seconds
                 continue
             inferences += 1
-            result = model(frame, classes=[0], conf=confidence, imgsz=640, verbose=False)[0]
+            result = model(frame, classes=[0], conf=confidence, imgsz=imgsz, verbose=False)[0]
             if len(result.boxes):
                 last_person[record["camera"]] = moment
                 thumbnail = save_thumbnail(frame, output_root, record["camera"], moment)
@@ -288,6 +288,8 @@ def main():
     scan_parser.add_argument("--date", required=True, help="YYYYMMDD, e.g. 20260324")
     scan_parser.add_argument("--sample-seconds", type=float, default=2.0)
     scan_parser.add_argument("--confidence", type=float, default=0.45)
+    scan_parser.add_argument("--imgsz", type=int, default=640,
+                             help="YOLO input edge length; 320 is much faster on low-power ARM NAS")
     scan_parser.add_argument("--merge-seconds", type=float, default=20.0)
     scan_parser.add_argument("--limit", type=int, help="only scan the first N files, for a trial")
     scan_parser.add_argument("--force", action="store_true", help="rescan files already present in the ledger")
@@ -324,7 +326,7 @@ def main():
         old_events = json.loads(target.read_text(encoding="utf-8"))["events"] if target.exists() else {}
         new_events = scan(
             pending, args.output, args.sample_seconds, args.confidence, args.merge_seconds,
-            args.motion_threshold, args.keepalive_seconds,
+            args.motion_threshold, args.keepalive_seconds, args.imgsz,
         )
         payload = {
             "date": args.date,

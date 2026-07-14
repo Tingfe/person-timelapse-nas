@@ -26,9 +26,9 @@ CAMERA_PATTERN = re.compile(r"^\d+$")
 LOCK = threading.Lock()
 PROCESSES = {}
 PROFILES = {
-    "eco": {"label": "节能", "sample_seconds": "10", "motion_threshold": "4"},
-    "balanced": {"label": "平衡", "sample_seconds": "5", "motion_threshold": "3"},
-    "precise": {"label": "精细", "sample_seconds": "2", "motion_threshold": "2"},
+    "turbo": {"label": "极速（Z2 推荐）", "sample_seconds": "30", "motion_threshold": "5", "imgsz": "320"},
+    "balanced": {"label": "平衡", "sample_seconds": "10", "motion_threshold": "4", "imgsz": "416"},
+    "precise": {"label": "精细", "sample_seconds": "5", "motion_threshold": "2", "imgsz": "640"},
 }
 
 
@@ -163,7 +163,7 @@ def create_task(payload):
         settings = PROFILES[profile]
         command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", date,
                     "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
-                    "--keepalive-seconds", "60"]
+                    "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
     else:
         command += ["export", str(INPUT_ROOT), str(events_path), str(OUTPUT_ROOT), "--camera", camera]
     thread = threading.Thread(target=task_worker, args=(task["id"], command, task["progress_file"]), daemon=True)

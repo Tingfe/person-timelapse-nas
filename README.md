@@ -80,7 +80,7 @@ http://极空间的局域网IP:8790
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名；
 - `DOCKERHUB_TOKEN`：Docker Hub 的 Access Token（不要填写账户密码）。
 
-之后每次推送 `main` 且修改 Dockerfile 或 `app/`，Actions 会发布 `latest` 和 `sha-提交哈希` 两个标签。工作流不含任何账户凭据；未配置这两个 Secret 时会自动跳过发布。
+之后每次推送 `main` 且修改 Dockerfile 或 `app/`，Actions 会发布 `latest` 和 `sha-提交哈希` 两个标签。工作流不含任何账户凭据；未配置这两个 Secret 时会跳过登录和推送步骤。
 
 ## 开源发布与隐私
 

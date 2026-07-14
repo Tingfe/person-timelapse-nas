@@ -4,10 +4,11 @@
 
 ## 先跑一小段
 
-在极空间 Docker 中新建项目，上传本目录的 `compose.yaml`。它默认拉取 ARM64 镜像 `tingfe/person-timelapse-nas:latest`；编辑 `compose.yaml` 的两个宿主机路径：
+在极空间 Docker 中新建项目，上传本目录的 `compose.yaml`。它默认拉取 ARM64 镜像 `tingfe/person-timelapse-nas:latest`；只需编辑一处宿主机路径：
 
 - `/你的/小米录像目录`：现有 MP4 的父目录，挂载为只读；
-- `/你的/人物延时输出目录`：新建的空目录，保存索引、缩略图和成片。
+
+项目启动时会自动在项目目录下创建并挂载 `output/`（索引、缩略图、成片）与 `models/`（首次下载的模型）。因此更新镜像无需重新选择这两个目录。
 
 启动容器后，在容器终端运行：
 
@@ -17,7 +18,7 @@ python /app/person_timelapse.py scan /input /output --date 20260324 --sample-sec
 
 更新时执行 `docker compose pull && docker compose up -d`，或在极空间界面中拉取最新镜像后重新创建项目。若希望固定在某次发布版本，可把 `image:` 改为 `tingfe/person-timelapse-nas:sha-提交哈希`。
 
-若在极空间中选择“从镜像创建容器”，镜像会自动启动管理页；仍需设置 `8790:8790` 端口映射，并挂载三个目录：录像目录到 `/input`（只读）、输出目录到 `/output`、任意可写空目录到 `/models`（保存首次下载的模型）。
+若在极空间中选择“从镜像创建容器”，镜像会自动启动管理页；仍需设置 `8790:8790` 端口映射，并手动选择录像目录挂载到 `/input`（只读）。推荐使用 Compose 项目部署，以便自动持久化 `output/` 和 `models/` 目录。
 
 首次验证单个录像文件时可附加 `--limit 1 --sample-seconds 5`，确认缩略图正确后再移除 `--limit`。
 每次成功扫描的文件都会登记在 `/output/processed.json`；下次运行会自动跳过相同的录像。若需主动重扫，附加 `--force`。

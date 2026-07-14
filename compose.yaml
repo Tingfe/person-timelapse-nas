@@ -7,7 +7,7 @@ services:
     command: ["python", "/app/web_server.py"]
     volumes:
       - /你的/小米录像目录:/input:ro
-      - /你的/人物延时输出目录:/output
+      - ./output:/output
       - ./models:/models
     ports:
       - "8790:8790"

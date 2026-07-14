@@ -4,7 +4,7 @@
 
 ## 先跑一小段
 
-在极空间 Docker 中新建项目，上传本目录的 `compose.yaml` 与 `app/person_timelapse.py`。编辑 `compose.yaml` 的两个宿主机路径：
+在极空间 Docker 中新建项目，上传本目录的 `compose.yaml`。它默认拉取 ARM64 镜像 `tingfe/person-timelapse-nas:latest`；编辑 `compose.yaml` 的两个宿主机路径：
 
 - `/你的/小米录像目录`：现有 MP4 的父目录，挂载为只读；
 - `/你的/人物延时输出目录`：新建的空目录，保存索引、缩略图和成片。
@@ -14,6 +14,8 @@
 ```sh
 python /app/person_timelapse.py scan /input /output --date 20260324 --sample-seconds 2
 ```
+
+更新时执行 `docker compose pull && docker compose up -d`，或在极空间界面中拉取最新镜像后重新创建项目。若希望固定在某次发布版本，可把 `image:` 改为 `tingfe/person-timelapse-nas:sha-提交哈希`。
 
 首次验证单个录像文件时可附加 `--limit 1 --sample-seconds 5`，确认缩略图正确后再移除 `--limit`。
 每次成功扫描的文件都会登记在 `/output/processed.json`；下次运行会自动跳过相同的录像。若需主动重扫，附加 `--force`。
@@ -70,6 +72,15 @@ http://极空间的局域网IP:8790
 运行中的任务每 5 秒自动更新一次，显示当前文件、文件数量、抽帧数、YOLO 推理次数、已运行时间和预计剩余时间；也可以在队列中取消任务。扫描可选择三档性能：`节能`（每 10 秒抽帧）、`平衡`（每 5 秒，默认）与 `精细`（每 2 秒）。为保护低配置 NAS，任务队列一次只运行一个任务。若管理页或 NAS 重启，正在运行的任务会标为“已中断”，已完成的文件与去重台账仍会保留。
 
 请只在家庭局域网内访问该端口，不要为 `8790` 设置公网端口映射。
+
+## 自动发布 Docker Hub
+
+仓库已包含 ARM64 的 GitHub Actions 工作流。首次启用时，在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中添加：
+
+- `DOCKERHUB_USERNAME`：Docker Hub 用户名；
+- `DOCKERHUB_TOKEN`：Docker Hub 的 Access Token（不要填写账户密码）。
+
+之后每次推送 `main` 且修改 Dockerfile 或 `app/`，Actions 会发布 `latest` 和 `sha-提交哈希` 两个标签。工作流不含任何账户凭据；未配置这两个 Secret 时会自动跳过发布。
 
 ## 开源发布与隐私
 

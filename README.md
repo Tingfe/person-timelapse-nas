@@ -17,6 +17,8 @@ python /app/person_timelapse.py scan /input /output --date 20260324 --sample-sec
 
 更新时执行 `docker compose pull && docker compose up -d`，或在极空间界面中拉取最新镜像后重新创建项目。若希望固定在某次发布版本，可把 `image:` 改为 `tingfe/person-timelapse-nas:sha-提交哈希`。
 
+若在极空间中选择“从镜像创建容器”，镜像会自动启动管理页；仍需设置 `8790:8790` 端口映射，并挂载三个目录：录像目录到 `/input`（只读）、输出目录到 `/output`、任意可写空目录到 `/models`（保存首次下载的模型）。
+
 首次验证单个录像文件时可附加 `--limit 1 --sample-seconds 5`，确认缩略图正确后再移除 `--limit`。
 每次成功扫描的文件都会登记在 `/output/processed.json`；下次运行会自动跳过相同的录像。若需主动重扫，附加 `--force`。
 

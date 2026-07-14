@@ -7,3 +7,6 @@ RUN apt-get -o Acquire::Retries=3 update \
 WORKDIR /app
 COPY app/ /app/
 RUN mkdir -p /models /output
+
+EXPOSE 8790
+CMD ["python", "/app/web_server.py"]

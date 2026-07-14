@@ -96,7 +96,14 @@ def available_dates():
 
 def task_worker(task_id, command, progress_file):
     environment = os.environ.copy()
-    environment["PROGRESS_PATH"] = str(OUTPUT_ROOT / progress_file)
+    progress_path = OUTPUT_ROOT / progress_file
+    environment["PROGRESS_PATH"] = str(progress_path)
+    write_json(progress_path, {
+        "phase": "starting",
+        "percent": 0,
+        "elapsed_seconds": 0,
+        "current_file": "正在加载人物识别模型…",
+    })
     process = None
     try:
         process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)

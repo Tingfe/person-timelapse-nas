@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -14,7 +15,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from person_timelapse import find_records, parse_record
+from person_timelapse import parse_record
 
 
 INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
@@ -24,6 +25,9 @@ TASKS_PATH = OUTPUT_ROOT / "tasks.json"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^\d+$")
 LOCK = threading.Lock()
+INVENTORY_LOCK = threading.Lock()
+INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}}
+INVENTORY_TTL_SECONDS = 30
 PROCESSES = {}
 PROFILES = {
     "turbo": {"label": "极速（Z2 推荐）", "sample_seconds": "30", "motion_threshold": "5", "imgsz": "320"},
@@ -88,24 +92,41 @@ def event_summary(date):
     }
 
 
+def inventory_snapshot():
+    """Cache the recursive source walk so automatic page refreshes stay cheap on a NAS."""
+    now = time.monotonic()
+    with INVENTORY_LOCK:
+        if INVENTORY["diagnostics"] and now - INVENTORY["updated_at"] < INVENTORY_TTL_SECONDS:
+            return INVENTORY
+        if not INPUT_ROOT.is_dir():
+            snapshot = {
+                "updated_at": now, "records": [],
+                "diagnostics": {"path": str(INPUT_ROOT), "available": False,
+                                "message": "容器内未找到 /input 挂载目录"},
+            }
+        else:
+            children = sorted(path.name for path in INPUT_ROOT.iterdir())[:8]
+            videos = [path for path in INPUT_ROOT.rglob("*") if path.is_file() and path.suffix.lower() == ".mp4"]
+            records = [record for path in videos if (record := parse_record(path))]
+            snapshot = {
+                "updated_at": now, "records": records,
+                "diagnostics": {"path": str(INPUT_ROOT), "available": True, "children": children,
+                                "mp4_files": len(videos), "recognized_files": len(records),
+                                "examples": [str(path.relative_to(INPUT_ROOT)) for path in videos[:3]]},
+            }
+        INVENTORY.update(snapshot)
+        return INVENTORY
+
+
 def available_dates():
-    source_days = {record["start"].strftime("%Y%m%d") for record in find_records(INPUT_ROOT, None)}
+    source_days = {record["start"].strftime("%Y%m%d") for record in inventory_snapshot()["records"]}
     result_days = {path.stem.removeprefix("events-") for path in OUTPUT_ROOT.glob("events-*.json")}
     return [event_summary(day) for day in sorted(source_days | result_days, reverse=True)]
 
 
 def source_diagnostics():
     """Expose just enough read-only mount information to diagnose an empty index."""
-    if not INPUT_ROOT.is_dir():
-        return {"path": str(INPUT_ROOT), "available": False, "message": "容器内未找到 /input 挂载目录"}
-    children = sorted(path.name for path in INPUT_ROOT.iterdir())[:8]
-    videos = [path for path in INPUT_ROOT.rglob("*") if path.is_file() and path.suffix.lower() == ".mp4"]
-    recognized = [path for path in videos if parse_record(path)]
-    return {
-        "path": str(INPUT_ROOT), "available": True, "children": children,
-        "mp4_files": len(videos), "recognized_files": len(recognized),
-        "examples": [str(path.relative_to(INPUT_ROOT)) for path in videos[:3]],
-    }
+    return inventory_snapshot()["diagnostics"]
 
 
 def task_worker(task_id, command, progress_file):

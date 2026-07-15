@@ -50,6 +50,11 @@ class FilenameParsingTests(unittest.TestCase):
         )
         self.assertEqual(record["camera"], "0")
 
+    def test_parses_legacy_file_without_camera_number(self):
+        record = MODULE_UNDER_TEST.parse_record(Path("20231127165410_20231127165439.mp4"))
+        self.assertEqual(record["camera"], "legacy")
+        self.assertEqual(record["start"], datetime(2023, 11, 27, 16, 54, 10))
+
     def test_source_id_changes_when_file_size_changes(self):
         path = Path(self.id().replace(".", "_"))
         record = {

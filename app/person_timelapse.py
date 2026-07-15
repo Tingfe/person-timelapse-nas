@@ -20,14 +20,23 @@ VIDEO_PATTERN = re.compile(
 NAME_PATTERN = re.compile(
     r"^(?P<camera>\d+)_(?P<start>\d{14})_(?P<end>\d{14})\.mp4$", re.IGNORECASE
 )
+LEGACY_PATTERN = re.compile(
+    r"^(?P<start>\d{14})_(?P<end>\d{14})\.mp4$", re.IGNORECASE
+)
 TIME_FORMAT = "%Y%m%d%H%M%S"
 
 
 def parse_record(path: Path):
     match = VIDEO_PATTERN.match(path.name) or NAME_PATTERN.match(path.name)
+    legacy = False
+    if not match:
+        match = LEGACY_PATTERN.match(path.name)
+        legacy = bool(match)
     if not match:
         return None
     values = match.groupdict()
+    if legacy:
+        values["camera"] = "legacy"
     try:
         values["start"] = datetime.strptime(values["start"], TIME_FORMAT)
         values["end"] = datetime.strptime(values["end"], TIME_FORMAT)

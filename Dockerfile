@@ -9,4 +9,4 @@ COPY app/ /app/
 RUN mkdir -p /models /output
 
 EXPOSE 8790
-CMD ["python", "/app/web_server.py"]
+CMD ["python", "-u", "/app/web_server.py"]

@@ -202,7 +202,12 @@ def cancel_task(task_id):
 
 class ConsoleHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
-        print(f"[web] {format % args}")
+        print(f"[web] {format % args}", flush=True)
+
+    def end_headers(self):
+        # The console is often upgraded in-place under the same LAN URL.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def send_json(self, body, status=HTTPStatus.OK):
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -274,8 +279,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 def main():
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     recover_interrupted_tasks()
-    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8790"))), ConsoleHandler)
-    print("Person Timelapse Console listening on port 8790")
+    port = int(os.environ.get("PORT", "8790"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), ConsoleHandler)
+    print(f"Person Timelapse Console listening on port {port}", flush=True)
     server.serve_forever()
 
 

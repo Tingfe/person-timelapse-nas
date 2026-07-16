@@ -3,8 +3,6 @@ services:
     # Change IMAGE only when using a fork or a pinned release tag.
     image: ${IMAGE:-tingfe/person-timelapse-nas:latest}
     container_name: person-timelapse
-    working_dir: /app
-    command: ["python", "/app/web_server.py"]
     volumes:
       - /你的/小米录像目录:/input:ro
       - ./output:/output

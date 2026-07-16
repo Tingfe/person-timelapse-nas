@@ -13,7 +13,7 @@
 启动容器后，在容器终端运行：
 
 ```sh
-python /app/person_timelapse.py scan /input /output --date 20260324 --sample-seconds 2
+python /opt/person-timelapse/person_timelapse.py scan /input /output --date 20260324 --sample-seconds 2
 ```
 
 更新时执行 `docker compose pull && docker compose up -d`，或在极空间界面中拉取最新镜像后重新创建项目。若希望固定在某次发布版本，可把 `image:` 改为 `tingfe/person-timelapse-nas:sha-提交哈希`。
@@ -38,7 +38,7 @@ python /app/person_timelapse.py scan /input /output --date 20260324 --sample-sec
 确认事件和缩略图正确后，导出某一路的延时视频：
 
 ```sh
-python /app/person_timelapse.py export /input /output/events-20260324.json /output \
+python /opt/person-timelapse/person_timelapse.py export /input /output/events-20260324.json /output \
   --camera 00 --fps 25 --frame-seconds 1
 ```
 

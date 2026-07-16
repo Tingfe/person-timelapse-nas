@@ -26,7 +26,7 @@ DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
 LOCK = threading.Lock()
 INVENTORY_LOCK = threading.Lock()
-INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}}
+INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": False}
 INVENTORY_TTL_SECONDS = 30
 PROCESSES = {}
 PROFILES = {
@@ -92,12 +92,10 @@ def event_summary(date):
     }
 
 
-def inventory_snapshot():
-    """Cache the recursive source walk so automatic page refreshes stay cheap on a NAS."""
+def refresh_inventory():
+    """Build the expensive recursive index off the HTTP request path."""
     now = time.monotonic()
-    with INVENTORY_LOCK:
-        if INVENTORY["diagnostics"] and now - INVENTORY["updated_at"] < INVENTORY_TTL_SECONDS:
-            return INVENTORY
+    try:
         if not INPUT_ROOT.is_dir():
             snapshot = {
                 "updated_at": now, "records": [],
@@ -114,19 +112,40 @@ def inventory_snapshot():
                                 "mp4_files": len(videos), "recognized_files": len(records),
                                 "examples": [str(path.relative_to(INPUT_ROOT)) for path in videos[:3]]},
             }
+    except OSError as error:  # A removable disk or NAS share may disappear mid-scan.
+        snapshot = {"updated_at": now, "records": [],
+                    "diagnostics": {"path": str(INPUT_ROOT), "available": False, "message": str(error)}}
+    with INVENTORY_LOCK:
         INVENTORY.update(snapshot)
-        return INVENTORY
+        INVENTORY["indexing"] = False
 
 
-def available_dates():
-    source_days = {record["start"].strftime("%Y%m%d") for record in inventory_snapshot()["records"]}
+def inventory_snapshot():
+    """Return immediately; refresh the large NAS inventory in one background worker."""
+    now = time.monotonic()
+    with INVENTORY_LOCK:
+        stale = not INVENTORY["diagnostics"] or now - INVENTORY["updated_at"] >= INVENTORY_TTL_SECONDS
+        if stale and not INVENTORY["indexing"]:
+            INVENTORY["indexing"] = True
+            threading.Thread(target=refresh_inventory, daemon=True, name="inventory-index").start()
+        snapshot = dict(INVENTORY)
+        snapshot["records"] = list(INVENTORY["records"])
+        snapshot["diagnostics"] = dict(INVENTORY["diagnostics"])
+        if snapshot["indexing"] and not snapshot["diagnostics"]:
+            snapshot["diagnostics"] = {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(),
+                                       "message": "正在后台建立历史录像索引，请稍候…"}
+        return snapshot
+
+
+def available_dates(snapshot=None):
+    source_days = {record["start"].strftime("%Y%m%d") for record in (snapshot or inventory_snapshot())["records"]}
     result_days = {path.stem.removeprefix("events-") for path in OUTPUT_ROOT.glob("events-*.json")}
     return [event_summary(day) for day in sorted(source_days | result_days, reverse=True)]
 
 
-def source_diagnostics():
+def source_diagnostics(snapshot=None):
     """Expose just enough read-only mount information to diagnose an empty index."""
-    return inventory_snapshot()["diagnostics"]
+    return (snapshot or inventory_snapshot())["diagnostics"]
 
 
 def task_worker(task_id, command, progress_file):
@@ -241,8 +260,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/overview":
-            self.send_json({"dates": available_dates(), "tasks": public_tasks(), "profiles": PROFILES,
-                            "diagnostics": source_diagnostics()})
+            snapshot = inventory_snapshot()
+            self.send_json({"dates": available_dates(snapshot), "tasks": public_tasks(), "profiles": PROFILES,
+                            "diagnostics": source_diagnostics(snapshot), "indexing": snapshot["indexing"]})
             return
         if path.startswith("/api/date/"):
             date = path.rsplit("/", 1)[-1]
@@ -300,6 +320,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 def main():
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     recover_interrupted_tasks()
+    inventory_snapshot()
     port = int(os.environ.get("PORT", "8790"))
     server = ThreadingHTTPServer(("0.0.0.0", port), ConsoleHandler)
     print(f"Person Timelapse Console listening on port {port}", flush=True)

@@ -30,6 +30,7 @@ INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": Fa
 INVENTORY_TTL_SECONDS = 30
 PROCESSES = {}
 PROFILES = {
+    "archive": {"label": "超极速（历史回放）", "sample_seconds": "120", "motion_threshold": "8", "imgsz": "256"},
     "turbo": {"label": "极速（Z2 推荐）", "sample_seconds": "30", "motion_threshold": "5", "imgsz": "320"},
     "balanced": {"label": "平衡", "sample_seconds": "10", "motion_threshold": "4", "imgsz": "416"},
     "precise": {"label": "精细", "sample_seconds": "5", "motion_threshold": "2", "imgsz": "640"},

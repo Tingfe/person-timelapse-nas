@@ -29,6 +29,6 @@
     async function cancel(id){if(!confirm('确定停止当前任务吗？已完成的结果会保留。'))return;try{await api('/api/tasks/'+id,{method:'DELETE'});$('#notice').textContent='正在停止任务…';await load()}catch(e){$('#notice').textContent=e.message}}
     $('#scan').onclick=()=>task('scan');$('#export').onclick=()=>task('export');$('#dateSelect').onchange=()=>{const date=$('#dateSelect').value.replaceAll('-','');if(date)showDate(date)};setInterval(load,5000);load();setInterval(()=>{const run=active();if(run&&$('#elapsed'))$('#elapsed').textContent=`${time(elapsed(run,run.progress))} 已运行`;$('#clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false})},1000);
   </script>
-  <script>setInterval(()=>{document.querySelector('#scan').disabled=false;document.querySelector('#export').disabled=false},500)</script>
+  <script>const archiveProfile=document.querySelector('#profile');archiveProfile.insertAdjacentHTML('afterbegin','<option value="archive">超极速（历史回放）· 120 秒抽帧 · 256px</option>');setInterval(()=>{document.querySelector('#scan').disabled=false;document.querySelector('#export').disabled=false},500)</script>
 </body>
 </html>

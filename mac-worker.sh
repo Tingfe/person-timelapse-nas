@@ -28,6 +28,14 @@ if [ ! -x "$VENV/bin/python" ]; then
   uv pip install --python "$VENV/bin/python" ultralytics
 fi
 
+MODEL_DIR="$VENV/models"
+MODEL_PATH="$MODEL_DIR/yolo11n.pt"
+mkdir -p "$MODEL_DIR"
+if [ ! -f "$MODEL_PATH" ]; then
+  echo "首次下载 Mac 专用人物识别模型…"
+  (cd "$MODEL_DIR" && "$VENV/bin/python" -c "from ultralytics import YOLO; YOLO('yolo11n.pt')")
+fi
+
 batch=1
 while [ "$batch" -le "$BATCHES" ]; do
   if [ "$REQUIRE_AC" = "1" ] && ! pmset -g batt | grep -q "AC Power"; then
@@ -35,7 +43,7 @@ while [ "$batch" -le "$BATCHES" ]; do
     exit 0
   fi
   echo "[Mac worker] 第 $batch/$BATCHES 批：$DATE（每批 5 个未处理文件，可随时 Ctrl-C）"
-  result=$("$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 2>&1) || { printf '%s\n' "$result"; exit 1; }
+  result=$(MODEL_PATH="$MODEL_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 2>&1) || { printf '%s\n' "$result"; exit 1; }
   printf '%s\n' "$result"
   printf '%s' "$result" | grep -q "no new files to scan" && exit 0
   batch=$((batch + 1))

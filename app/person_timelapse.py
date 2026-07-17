@@ -48,11 +48,13 @@ def parse_record(path: Path):
     return values
 
 
-def find_records(root: Path, day: Optional[str]):
+def find_records(root: Path, day: Optional[str] = None, days=None):
     records = []
     for path in root.rglob("*.mp4"):
         record = parse_record(path)
-        if record and (not day or record["start"].strftime("%Y%m%d") == day):
+        if record and (not day or record["start"].strftime("%Y%m%d") == day) and (
+            not days or record["start"].strftime("%Y%m%d") in days
+        ):
             records.append(record)
     return sorted(records, key=lambda item: (item["camera"], item["start"], item["path"].name))
 
@@ -308,8 +310,8 @@ def main():
                              help="continue person checks after a recent detection when motion gating is enabled")
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("input", type=Path)
-    export_parser.add_argument("events", type=Path)
     export_parser.add_argument("output", type=Path)
+    export_parser.add_argument("events", type=Path, nargs="+")
     export_parser.add_argument("--camera", required=True)
     export_parser.add_argument("--fps", type=int, default=25)
     export_parser.add_argument("--frame-seconds", type=float, default=1.0)
@@ -354,10 +356,12 @@ def main():
         save_ledger(args.output, ledger)
         print(target)
     elif args.command == "export":
-        payload = json.loads(args.events.read_text(encoding="utf-8"))
-        day = payload["date"]
-        records = find_records(args.input, day)
-        export(records, read_events(args.events, args.camera), args.output, args.camera, day, args.frame_seconds, args.fps)
+        payloads = [json.loads(path.read_text(encoding="utf-8")) for path in args.events]
+        days = [payload["date"] for payload in payloads]
+        records = find_records(args.input, days=set(days))
+        events = [event for path in args.events for event in read_events(path, args.camera)]
+        label = days[0] if len(days) == 1 else f"{min(days)}-{max(days)}"
+        export(records, events, args.output, args.camera, label, args.frame_seconds, args.fps)
     elif args.command == "inventory":
         records = find_records(args.input, args.date)
         print(json.dumps([{

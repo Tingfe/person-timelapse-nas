@@ -24,6 +24,9 @@ services:
   person-timelapse:
     image: tingfe/person-timelapse-nas:latest
     container_name: person-timelapse
+    environment:
+      # 使用强密码；也可留空，首次启动后在 output/.access-password 查看随机密码
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     volumes:
       # 改为你的录像目录；务必保留 :ro
       - "/path/to/your/camera-recordings:/input:ro"
@@ -40,6 +43,8 @@ services:
 ```text
 http://NAS 的局域网 IP:8790
 ```
+
+首次访问需要输入密码。推荐在极空间项目的环境变量中设置 `AUTH_PASSWORD`；若留空，服务会生成随机密码，并保存到持久化的 `output/.access-password`（也会打印在首次启动日志中）。
 
 首次启动会后台读取录像目录并建立日期索引。索引较大时仍可直接输入已知日期，将扫描任务加入队列。
 

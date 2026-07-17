@@ -3,6 +3,9 @@ services:
     # Change IMAGE only when using a fork or a pinned release tag.
     image: ${IMAGE:-tingfe/person-timelapse-nas:latest}
     container_name: person-timelapse
+    environment:
+      # 建议设置强密码；留空时首次启动会生成随机密码并写入 output/.access-password。
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     volumes:
       - /你的/小米录像目录:/input:ro
       - ./output:/output

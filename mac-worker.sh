@@ -10,9 +10,11 @@ VENV=${VENV:-"$PWD/.mac-worker-venv"}
 REQUIRE_AC=${REQUIRE_AC:-1}
 MAC_PRIORITY=${MAC_PRIORITY:-1}
 PRIORITY_PATH="$OUTPUT_ROOT/.mac-priority.lock"
+PROGRESS_PATH=${PROGRESS_PATH:-"$OUTPUT_ROOT/progress-mac-worker.json"}
 
 [ -d "$INPUT_ROOT" ] || { echo "NAS 录像目录未挂载：$INPUT_ROOT"; exit 1; }
 [ -d "$OUTPUT_ROOT" ] || { echo "NAS 输出目录不可用：$OUTPUT_ROOT"; exit 1; }
+rm -f "$PROGRESS_PATH"
 
 heartbeat=""
 if [ "$MAC_PRIORITY" = "1" ]; then
@@ -43,8 +45,6 @@ while [ "$batch" -le "$BATCHES" ]; do
     exit 0
   fi
   echo "[Mac worker] 第 $batch/$BATCHES 批：${DATE}（每批 5 个未处理文件，可随时 Ctrl-C）"
-  result=$(MODEL_PATH="$MODEL_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 2>&1) || { printf '%s\n' "$result"; exit 1; }
-  printf '%s\n' "$result"
-  printf '%s' "$result" | grep -q "no new files to scan" && exit 0
+  MODEL_PATH="$MODEL_PATH" PROGRESS_PATH="$PROGRESS_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 || exit $?
   batch=$((batch + 1))
 done

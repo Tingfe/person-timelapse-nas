@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
 OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/output"))
 APP_ROOT = Path(__file__).parent
 TASKS_PATH = OUTPUT_ROOT / "tasks.json"
+INVENTORY_DB_PATH = OUTPUT_ROOT / "inventory.sqlite3"
 PASSWORD_PATH = OUTPUT_ROOT / ".access-password"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
@@ -119,6 +121,47 @@ def event_summary(date):
     }
 
 
+def indexed_records(root, database):
+    """Reuse parsed filename metadata unless the NAS file changed."""
+    connection = sqlite3.connect(database)
+    connection.execute("""CREATE TABLE IF NOT EXISTS videos (
+        path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
+        camera TEXT NOT NULL, start TEXT NOT NULL, ending TEXT NOT NULL, seen TEXT NOT NULL)""")
+    scan_id = uuid.uuid4().hex
+    records, mp4_files = [], 0
+    try:
+        for path in root.rglob("*.mp4"):
+            if not path.is_file():
+                continue
+            mp4_files += 1
+            relative = str(path.relative_to(root))
+            stat = path.stat()
+            row = connection.execute(
+                "SELECT mtime_ns,size,camera,start,ending FROM videos WHERE path=?", (relative,)
+            ).fetchone()
+            if row and row[:2] == (stat.st_mtime_ns, stat.st_size):
+                camera, start, ending = row[2:]
+                record = {"path": path, "camera": camera,
+                          "start": datetime.strptime(start, "%Y%m%d%H%M%S"),
+                          "end": datetime.strptime(ending, "%Y%m%d%H%M%S")}
+            else:
+                record = parse_record(path)
+                if record:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?)",
+                        (relative, stat.st_mtime_ns, stat.st_size, record["camera"],
+                         record["start"].strftime("%Y%m%d%H%M%S"), record["end"].strftime("%Y%m%d%H%M%S"), scan_id),
+                    )
+            if record:
+                connection.execute("UPDATE videos SET seen=? WHERE path=?", (scan_id, relative))
+                records.append(record)
+        connection.execute("DELETE FROM videos WHERE seen != ?", (scan_id,))
+        connection.commit()
+    finally:
+        connection.close()
+    return sorted(records, key=lambda item: item["start"]), mp4_files
+
+
 def refresh_inventory():
     """Build the expensive recursive index off the HTTP request path."""
     now = time.monotonic()
@@ -131,13 +174,13 @@ def refresh_inventory():
             }
         else:
             children = sorted(path.name for path in INPUT_ROOT.iterdir())[:8]
-            videos = [path for path in INPUT_ROOT.rglob("*") if path.is_file() and path.suffix.lower() == ".mp4"]
-            records = [record for path in videos if (record := parse_record(path))]
+            records, mp4_files = indexed_records(INPUT_ROOT, INVENTORY_DB_PATH)
             snapshot = {
                 "updated_at": now, "records": records,
                 "diagnostics": {"path": str(INPUT_ROOT), "available": True, "children": children,
-                                "mp4_files": len(videos), "recognized_files": len(records),
-                                "examples": [str(path.relative_to(INPUT_ROOT)) for path in videos[:3]]},
+                                "mp4_files": mp4_files, "recognized_files": len(records),
+                                "index_database": str(INVENTORY_DB_PATH),
+                                "examples": [str(record["path"].relative_to(INPUT_ROOT)) for record in records[:3]]},
             }
     except OSError as error:  # A removable disk or NAS share may disappear mid-scan.
         snapshot = {"updated_at": now, "records": [],

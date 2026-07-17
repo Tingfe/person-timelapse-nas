@@ -83,6 +83,17 @@ image: tingfe/person-timelapse-nas:sha-提交哈希
 
 如果超极速仍无法接受，最有效的方案是让 NAS 仅保存录像，在带 GPU 的电脑上挂载 NAS 目录执行识别。
 
+### Mac 间歇计算节点（实验性）
+
+Apple Silicon Mac 可用 Metal/MPS 参与计算。将 NAS 的录像目录与 `延时摄影` 输出目录通过 SMB 挂载到 Mac 后，在本仓库运行：
+
+```sh
+chmod +x mac-worker.sh
+./mac-worker.sh 20260324 2
+```
+
+每批最多处理 5 个未处理 MP4；可随时按 `Ctrl-C` 停止，已完成文件会记录在 NAS 的 `processed.json`，下次运行自动续接。首次运行只会在仓库目录创建 `.mac-worker-venv` 独立虚拟环境，不修改系统 Python、Homebrew 或 Docker。运行 Mac worker 时，请不要让 NAS 对同一日期执行扫描任务。
+
 ## 支持的文件名
 
 文件名时间用于归档，不依赖 NAS 的修改时间。支持例如：

@@ -92,6 +92,14 @@ chmod +x mac-worker.sh
 ./mac-worker.sh 20260324 2
 ```
 
+也可以启动仅限本机访问的可视化控制台：
+
+```sh
+sh mac-console.sh
+```
+
+随后打开 `http://127.0.0.1:8791`，选择日期和批次数，一键启动或停止；日志会直接显示在页面内。
+
 每批最多处理 5 个未处理 MP4；可随时按 `Ctrl-C` 停止，已完成文件会记录在 NAS 的 `processed.json`，下次运行自动续接。首次运行只会在仓库目录创建 `.mac-worker-venv` 独立虚拟环境，不修改系统 Python、Homebrew 或 Docker。运行 Mac worker 时，请不要让 NAS 对同一日期执行扫描任务。
 
 ## 支持的文件名

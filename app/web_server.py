@@ -2,8 +2,10 @@
 """Local-only web console for the person timelapse workflow."""
 
 import json
+import hmac
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -22,6 +24,7 @@ INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
 OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/output"))
 APP_ROOT = Path(__file__).parent
 TASKS_PATH = OUTPUT_ROOT / "tasks.json"
+PASSWORD_PATH = OUTPUT_ROOT / ".access-password"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
 LOCK = threading.Lock()
@@ -29,6 +32,8 @@ INVENTORY_LOCK = threading.Lock()
 INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": False}
 INVENTORY_TTL_SECONDS = 30
 PROCESSES = {}
+SESSIONS = set()
+ACCESS_PASSWORD = ""
 PROFILES = {
     "archive": {"label": "超极速（历史回放）", "sample_seconds": "120", "motion_threshold": "8", "imgsz": "256"},
     "turbo": {"label": "极速（Z2 推荐）", "sample_seconds": "30", "motion_threshold": "5", "imgsz": "320"},
@@ -69,6 +74,27 @@ def recover_interrupted_tasks():
             changed = True
     if changed:
         save_tasks(tasks)
+
+
+def load_access_password():
+    configured = os.environ.get("AUTH_PASSWORD", "").strip()
+    if configured:
+        return configured
+    if PASSWORD_PATH.exists():
+        return PASSWORD_PATH.read_text(encoding="utf-8").strip()
+    password = secrets.token_urlsafe(12)
+    PASSWORD_PATH.write_text(password, encoding="utf-8")
+    os.chmod(PASSWORD_PATH, 0o600)
+    print(f"Generated local access password: {password}", flush=True)
+    return password
+
+
+def session_from_headers(headers):
+    for item in headers.get("Cookie", "").split(";"):
+        name, _, value = item.strip().partition("=")
+        if name == "person_timelapse_session" and value in SESSIONS:
+            return value
+    return None
 
 
 def public_tasks():
@@ -300,8 +326,27 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def authenticated(self):
+        return bool(session_from_headers(self.headers))
+
+    def require_login(self):
+        if self.authenticated():
+            return False
+        if self.path.startswith("/api/"):
+            self.send_json({"error": "请先登录"}, HTTPStatus.UNAUTHORIZED)
+        else:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/login")
+            self.end_headers()
+        return True
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/login":
+            self.path = "/web/login.html"
+            return super().do_GET()
+        if self.require_login():
+            return
         if path == "/api/health":
             self.send_json({"ok": True, "inventory": inventory_status()})
             return
@@ -342,7 +387,25 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/tasks":
+        path = urlparse(self.path).path
+        if path == "/api/login":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                password = json.loads(self.rfile.read(length)).get("password", "")
+                if not hmac.compare_digest(password, ACCESS_PASSWORD):
+                    self.send_json({"error": "密码错误"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                token = secrets.token_urlsafe(32)
+                SESSIONS.add(token)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Set-Cookie", f"person_timelapse_session={token}; HttpOnly; SameSite=Strict; Path=/")
+                self.end_headers()
+            except (ValueError, json.JSONDecodeError):
+                self.send_json({"error": "登录请求无效"}, HTTPStatus.BAD_REQUEST)
+            return
+        if self.require_login():
+            return
+        if path != "/api/tasks":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
@@ -353,6 +416,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
     def do_DELETE(self):
+        if self.require_login():
+            return
         path = urlparse(self.path).path
         if not path.startswith("/api/tasks/"):
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -364,7 +429,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    global ACCESS_PASSWORD
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    ACCESS_PASSWORD = load_access_password()
     recover_interrupted_tasks()
     start_next_task()
     inventory_snapshot()

@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -158,6 +158,33 @@ def inventory_status():
         }
 
 
+def task_command(task):
+    command = [sys.executable, str(APP_ROOT / "person_timelapse.py")]
+    if task["kind"] == "scan":
+        settings = PROFILES[task["profile"]]
+        return command + ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", task["date"],
+                          "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
+                          "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
+    events = [str(OUTPUT_ROOT / f"events-{day}.json") for day in task["dates"]]
+    return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
+
+
+def start_next_task():
+    with LOCK:
+        tasks = load_tasks()
+        if any(task["status"] == "running" for task in tasks["tasks"]):
+            return
+        task = next((item for item in tasks["tasks"] if item["status"] == "queued"), None)
+        if not task:
+            return
+        task["status"] = "running"
+        task["started_at"] = datetime.now().isoformat(timespec="seconds")
+        task["detail"] = "任务已启动"
+        save_tasks(tasks)
+    thread = threading.Thread(target=task_worker, args=(task["id"], task_command(task), task["progress_file"]), daemon=True)
+    thread.start()
+
+
 def task_worker(task_id, command, progress_file):
     environment = os.environ.copy()
     progress_path = OUTPUT_ROOT / progress_file
@@ -187,6 +214,7 @@ def task_worker(task_id, command, progress_file):
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 task["detail"] = detail
         save_tasks(tasks)
+    start_next_task()
 
 
 def create_task(payload):
@@ -200,38 +228,37 @@ def create_task(payload):
         raise ValueError("性能档位无效")
     if kind == "export" and not CAMERA_PATTERN.fullmatch(camera):
         raise ValueError("导出任务需要摄像头编号")
-    events_path = OUTPUT_ROOT / f"events-{date}.json"
-    if kind == "export" and not events_path.exists():
-        raise ValueError("请先完成该日期的扫描任务")
+    end_date = payload.get("end_date") or date
+    if not DATE_PATTERN.fullmatch(end_date) or end_date < date:
+        raise ValueError("结束日期无效")
+    dates = []
+    cursor = datetime.strptime(date, "%Y%m%d")
+    finish = datetime.strptime(end_date, "%Y%m%d")
+    while cursor <= finish:
+        dates.append(cursor.strftime("%Y%m%d"))
+        cursor += timedelta(days=1)
+    if kind == "export":
+        missing = [day for day in dates if not (OUTPUT_ROOT / f"events-{day}.json").exists()]
+        if missing:
+            raise ValueError(f"请先完成日期扫描：{missing[0]}{' 等' if len(missing) > 1 else ''}")
 
     with LOCK:
         tasks = load_tasks()
-        if any(task["status"] == "running" for task in tasks["tasks"]):
-            raise RuntimeError("已有任务正在运行。为保护 NAS，管理页一次只运行一个任务。")
         task = {
             "id": uuid.uuid4().hex[:8],
             "kind": kind,
             "date": date,
             "camera": camera or None,
             "profile": profile if kind == "scan" else None,
-            "status": "running",
+            "status": "queued",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "detail": "任务已启动",
+            "dates": dates,
         }
         task["progress_file"] = f"progress-{task['id']}.json"
-        tasks["tasks"].insert(0, task)
+        tasks["tasks"].append(task)
         save_tasks(tasks)
-
-    command = [sys.executable, str(APP_ROOT / "person_timelapse.py")]
-    if kind == "scan":
-        settings = PROFILES[profile]
-        command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", date,
-                    "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
-                    "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
-    else:
-        command += ["export", str(INPUT_ROOT), str(events_path), str(OUTPUT_ROOT), "--camera", camera]
-    thread = threading.Thread(target=task_worker, args=(task["id"], command, task["progress_file"]), daemon=True)
-    thread.start()
+    start_next_task()
     return task
 
 
@@ -239,8 +266,13 @@ def cancel_task(task_id):
     with LOCK:
         tasks = load_tasks()
         task = next((item for item in tasks["tasks"] if item["id"] == task_id), None)
-        if not task or task["status"] != "running":
-            raise ValueError("没有可取消的运行中任务")
+        if not task or task["status"] not in {"running", "queued"}:
+            raise ValueError("没有可取消的任务")
+        if task["status"] == "queued":
+            task["status"] = "cancelled"
+            task["detail"] = "已从队列移除"
+            save_tasks(tasks)
+            return {"id": task_id, "status": "cancelled"}
         task["cancel_requested"] = True
         task["detail"] = "正在停止任务…"
         save_tasks(tasks)
@@ -333,6 +365,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 def main():
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     recover_interrupted_tasks()
+    start_next_task()
     inventory_snapshot()
     port = int(os.environ.get("PORT", "8790"))
     server = ThreadingHTTPServer(("0.0.0.0", port), ConsoleHandler)

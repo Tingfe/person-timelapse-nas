@@ -42,7 +42,7 @@ while [ "$batch" -le "$BATCHES" ]; do
     echo "Mac 未接电，停止领取下一批；接电后重新点击开始即可续接。"
     exit 0
   fi
-  echo "[Mac worker] 第 $batch/$BATCHES 批：$DATE（每批 5 个未处理文件，可随时 Ctrl-C）"
+  echo "[Mac worker] 第 $batch/$BATCHES 批：${DATE}（每批 5 个未处理文件，可随时 Ctrl-C）"
   result=$(MODEL_PATH="$MODEL_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 2>&1) || { printf '%s\n' "$result"; exit 1; }
   printf '%s\n' "$result"
   printf '%s' "$result" | grep -q "no new files to scan" && exit 0

@@ -18,7 +18,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from person_timelapse import parse_record
+from person_timelapse import load_ledger, parse_record, source_id
 
 
 INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
@@ -111,7 +111,7 @@ def public_tasks():
     return result
 
 
-def event_summary(date):
+def event_summary(date, total_files=0, processed_files=0, scan_status="pending"):
     events = read_json(OUTPUT_ROOT / f"events-{date}.json", {})
     groups = events.get("events", {})
     return {
@@ -119,6 +119,9 @@ def event_summary(date):
         "events": sum(len(group) for group in groups.values()),
         "cameras": sorted(groups.keys()),
         "ready": bool(groups),
+        "total_files": total_files,
+        "processed_files": processed_files,
+        "scan_status": scan_status,
     }
 
 
@@ -168,6 +171,7 @@ def indexed_records(root, database):
                          record["start"].strftime("%Y%m%d%H%M%S"), record["end"].strftime("%Y%m%d%H%M%S"), scan_id),
                     )
             if record:
+                record["size"] = stat.st_size
                 connection.execute("UPDATE videos SET seen=? WHERE path=?", (scan_id, relative))
                 records.append(record)
         connection.execute("DELETE FROM videos WHERE seen != ?", (scan_id,))
@@ -227,9 +231,36 @@ def inventory_snapshot():
 
 
 def available_dates(snapshot=None):
-    source_days = {record["start"].strftime("%Y%m%d") for record in (snapshot or inventory_snapshot())["records"]}
+    records = (snapshot or inventory_snapshot())["records"]
+    records_by_day = {}
+    for record in records:
+        records_by_day.setdefault(record["start"].strftime("%Y%m%d"), []).append(record)
+    source_days = set(records_by_day)
     result_days = {path.stem.removeprefix("events-") for path in OUTPUT_ROOT.glob("events-*.json")}
-    return [event_summary(day) for day in sorted(source_days | result_days, reverse=True)]
+    processed_sources = set(load_ledger(OUTPUT_ROOT).get("sources", {}))
+    active_days = {}
+    for task in load_tasks()["tasks"]:
+        if task.get("kind") == "scan" and task.get("status") in {"queued", "running"}:
+            for day in task.get("dates", [task["date"]]):
+                active_days[day] = task["status"]
+    summaries = []
+    for day in sorted(source_days | result_days, reverse=True):
+        day_records = records_by_day.get(day, [])
+        total_files = len(day_records)
+        processed_files = sum(source_id(record) in processed_sources for record in day_records)
+        if day in active_days:
+            scan_status = "scanning" if active_days[day] == "running" else "queued"
+        elif total_files and processed_files == total_files:
+            scan_status = "completed"
+        elif processed_files:
+            scan_status = "partial"
+        elif day in result_days:
+            # Older releases may have a completed event file without a ledger entry.
+            scan_status = "completed"
+        else:
+            scan_status = "pending"
+        summaries.append(event_summary(day, total_files, processed_files, scan_status))
+    return summaries
 
 
 def source_diagnostics(snapshot=None):
@@ -343,9 +374,21 @@ def create_task(payload):
         missing = [day for day in dates if not (OUTPUT_ROOT / f"events-{day}.json").exists()]
         if missing:
             raise ValueError(f"请先完成日期扫描：{missing[0]}{' 等' if len(missing) > 1 else ''}")
+    if kind == "scan":
+        summary = next((item for item in available_dates(inventory_snapshot()) if item["date"] == date), None)
+        if summary and summary["scan_status"] == "completed":
+            raise ValueError(f"{date} 已完成扫描，系统会自动跳过重复处理。")
+        if summary and summary["scan_status"] in {"queued", "scanning"}:
+            raise ValueError(f"{date} 已在任务队列中，无需重复添加。")
 
     with LOCK:
         tasks = load_tasks()
+        if kind == "scan" and any(
+            item.get("kind") == "scan" and item.get("status") in {"queued", "running"}
+            and date in item.get("dates", [item.get("date")])
+            for item in tasks["tasks"]
+        ):
+            raise ValueError(f"{date} 已在任务队列中，无需重复添加。")
         task = {
             "id": uuid.uuid4().hex[:8],
             "kind": kind,

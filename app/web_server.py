@@ -26,6 +26,7 @@ OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/output"))
 APP_ROOT = Path(__file__).parent
 TASKS_PATH = OUTPUT_ROOT / "tasks.json"
 INVENTORY_DB_PATH = OUTPUT_ROOT / "inventory.sqlite3"
+MAC_PRIORITY_PATH = OUTPUT_ROOT / ".mac-priority.lock"
 PASSWORD_PATH = OUTPUT_ROOT / ".access-password"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
@@ -257,8 +258,21 @@ def task_command(task):
     return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
 
 
+def mac_priority_active():
+    """Mac worker renews this lease every minute while it owns compute priority."""
+    try:
+        if time.time() - MAC_PRIORITY_PATH.stat().st_mtime > 15 * 60:
+            MAC_PRIORITY_PATH.unlink()
+            return False
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def start_next_task():
     with LOCK:
+        if mac_priority_active():
+            return
         tasks = load_tasks()
         if any(task["status"] == "running" for task in tasks["tasks"]):
             return

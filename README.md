@@ -102,6 +102,8 @@ sh mac-console.sh
 
 每批最多处理 5 个未处理 MP4；可随时按 `Ctrl-C` 停止，已完成文件会记录在 NAS 的 `processed.json`，下次运行自动续接。首次运行只会在仓库目录创建 `.mac-worker-venv` 独立虚拟环境，不修改系统 Python、Homebrew 或 Docker。运行 Mac worker 时，请不要让 NAS 对同一日期执行扫描任务。
 
+Mac worker 默认会取得“计算优先权”：运行期间 NAS 不会启动新的扫描任务；Mac 正常结束、停止或离线超过 15 分钟后，NAS 队列自动恢复。已在 NAS 运行中的任务不会被强行中断。
+
 Mac 也可以协助建立 NAS 日期索引，不需要安装 AI 依赖：
 
 ```sh

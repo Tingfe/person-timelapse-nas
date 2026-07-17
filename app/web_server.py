@@ -123,6 +123,20 @@ def event_summary(date):
 
 def indexed_records(root, database):
     """Reuse parsed filename metadata unless the NAS file changed."""
+    lock_path = database.parent / ".inventory-index.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+            if age > 12 * 3600:
+                lock_path.unlink()
+                return indexed_records(root, database)
+        except OSError:
+            pass
+        raise RuntimeError("另一台设备正在建立录像索引，请稍后重试")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
+        lock_file.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
     connection = sqlite3.connect(database)
     connection.execute("""CREATE TABLE IF NOT EXISTS videos (
         path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -159,6 +173,10 @@ def indexed_records(root, database):
         connection.commit()
     finally:
         connection.close()
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
     return sorted(records, key=lambda item: item["start"]), mp4_files
 
 
@@ -182,9 +200,9 @@ def refresh_inventory():
                                 "index_database": str(INVENTORY_DB_PATH),
                                 "examples": [str(record["path"].relative_to(INPUT_ROOT)) for record in records[:3]]},
             }
-    except OSError as error:  # A removable disk or NAS share may disappear mid-scan.
+    except (OSError, RuntimeError) as error:  # A removable disk/share may disappear or another node owns the index.
         snapshot = {"updated_at": now, "records": [],
-                    "diagnostics": {"path": str(INPUT_ROOT), "available": False, "message": str(error)}}
+                    "diagnostics": {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(), "message": str(error)}}
     with INVENTORY_LOCK:
         INVENTORY.update(snapshot)
         INVENTORY["indexing"] = False

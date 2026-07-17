@@ -47,7 +47,9 @@ def run_worker(date, batches, require_ac):
     try:
         with LOCK:
             environment = dict(os.environ, REQUIRE_AC="1" if require_ac else "0")
-            PROCESS = subprocess.Popen(["sh", str(ROOT / "mac-worker.sh"), date, str(batches)], cwd=ROOT, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            PROCESS = subprocess.Popen(["sh", str(ROOT / "mac-worker.sh"), date, str(batches)], cwd=ROOT, env=environment,
+                                       text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
         for line in PROCESS.stdout:
             with LOCK: LOGS.append(line.rstrip())
     finally:

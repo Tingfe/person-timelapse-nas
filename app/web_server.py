@@ -148,6 +148,16 @@ def source_diagnostics(snapshot=None):
     return (snapshot or inventory_snapshot())["diagnostics"]
 
 
+def inventory_status():
+    """A mount-free status probe for diagnosing a slow source index."""
+    with INVENTORY_LOCK:
+        return {
+            "indexing": INVENTORY["indexing"],
+            "updated_at": INVENTORY["updated_at"],
+            "has_index": bool(INVENTORY["diagnostics"]),
+        }
+
+
 def task_worker(task_id, command, progress_file):
     environment = os.environ.copy()
     progress_path = OUTPUT_ROOT / progress_file
@@ -259,6 +269,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/health":
+            self.send_json({"ok": True, "inventory": inventory_status()})
+            return
         if path == "/api/overview":
             snapshot = inventory_snapshot()
             self.send_json({"dates": available_dates(snapshot), "tasks": public_tasks(), "profiles": PROFILES,

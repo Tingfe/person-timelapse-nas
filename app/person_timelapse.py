@@ -60,7 +60,9 @@ def find_records(root: Path, day: Optional[str] = None, days=None):
 
 
 def source_id(record):
-    size = record["path"].stat().st_size
+    size = record.get("size")
+    if size is None:
+        size = record["path"].stat().st_size
     return ":".join((
         record["camera"], record["start"].strftime(TIME_FORMAT), record["end"].strftime(TIME_FORMAT), str(size)
     ))

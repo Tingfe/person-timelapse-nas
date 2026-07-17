@@ -2,8 +2,8 @@
 # Native Apple-Silicon worker. Everything it installs stays in .mac-worker-venv.
 set -eu
 
-DATE=${1:?"Usage: ./mac-worker.sh YYYYMMDD [batches]"}
-BATCHES=${2:-1}
+DATE=${1:?"Usage: ./mac-worker.sh YYYYMMDD [max_files]"}
+MAX_FILES=${2:-5}
 INPUT_ROOT=${INPUT_ROOT:-"/Volumes/sata11-155XXXX2337/摄像头文件备份"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/Volumes/sata11-155XXXX2337/摄像头文件备份/延时摄影"}
 VENV=${VENV:-"$PWD/.mac-worker-venv"}
@@ -38,13 +38,9 @@ if [ ! -f "$MODEL_PATH" ]; then
   (cd "$MODEL_DIR" && "$VENV/bin/python" -c "from ultralytics import YOLO; YOLO('yolo11n.pt')")
 fi
 
-batch=1
-while [ "$batch" -le "$BATCHES" ]; do
-  if [ "$REQUIRE_AC" = "1" ] && ! pmset -g batt | grep -q "AC Power"; then
-    echo "Mac 未接电，停止领取下一批；接电后重新点击开始即可续接。"
-    exit 0
-  fi
-  echo "[Mac worker] 第 $batch/$BATCHES 批：${DATE}（每批 5 个未处理文件，可随时 Ctrl-C）"
-  MODEL_PATH="$MODEL_PATH" PROGRESS_PATH="$PROGRESS_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit 5 --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 || exit $?
-  batch=$((batch + 1))
-done
+if [ "$REQUIRE_AC" = "1" ] && ! pmset -g batt | grep -q "AC Power"; then
+  echo "Mac 未接电，停止领取任务；接电后重新点击开始即可续接。"
+  exit 0
+fi
+echo "[Mac worker] ${DATE}：本次最多处理 ${MAX_FILES} 个未处理文件，可随时 Ctrl-C"
+MODEL_PATH="$MODEL_PATH" PROGRESS_PATH="$PROGRESS_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit "$MAX_FILES" --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256

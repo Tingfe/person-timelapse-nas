@@ -25,6 +25,17 @@ PAGE = """<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewpor
 <main><div class=tag>LOCALHOST ONLY · MPS / METAL WORKER</div><h1>Mac 影像协处理</h1><div class=grid><section class=card><div class=tag>步骤一 · 读取目录</div><div class=actions><button id=index>建立 / 刷新索引</button></div><p class=note>只解析视频文件名与日期，写入共享的 inventory.sqlite3；不调用 AI，也不生成视频。</p><div class=tag style='margin-top:24px'>步骤二 · 人物扫描</div><label>录像日期<select id=date><option>正在读取 NAS 日期索引…</option></select></label><div class=note id=dateHint></div><label>执行批数 <input id=batches type=number min=1 max=50 value=1></label><label><input id=ac type=checkbox checked> 仅在接电时领取下一批</label><div class=actions><button id=start>开始协处理</button><button class=stop id=stop>停止当前任务</button></div><p class=note>扫描会调用 Mac 的 MPS/Metal，每批最多处理 5 个未处理文件；结果写回 NAS，之后可在 NAS 管理页制作延时视频。</p></section><section class='card status'><div class=tag style='color:#a9caba'>运行状态</div><p><span id=dot class=dot></span><strong id=status>检查中</strong></p><p id=detail>仅监听 127.0.0.1，不对局域网开放。</p><p id=progress>尚未开始</p></section><section class=card style='grid-column:1/-1'><div class=tag style='margin-bottom:10px'>实时日志</div><pre id=logs>正在连接本地工作节点…</pre></section></div></main><script>
 const $=s=>document.querySelector(s),api=(url,opt)=>fetch(url,opt).then(async r=>{const d=await r.json();if(!r.ok)throw Error(d.error);return d});const duration=s=>{if(s==null)return '计算中';s=Math.round(s);return s<60?`${s} 秒`:s<3600?`${Math.floor(s/60)} 分 ${s%60} 秒`:`${Math.floor(s/3600)} 小时 ${Math.floor(s%3600/60)} 分`};async function dates(){const selected=$('#date').value,d=await api('/api/dates');$('#dateHint').textContent=d.message;$('#date').innerHTML=d.dates.map(x=>`<option value="${x}">${x.slice(0,4)}.${x.slice(4,6)}.${x.slice(6)}</option>`).join('')||'<option value="">没有可用日期</option>';if(d.dates.includes(selected))$('#date').value=selected}async function refresh(){try{const s=await api('/api/status'),p=s.progress||{},indexing=s.kind==='index';$('#status').textContent=s.running?(indexing?'正在建立索引':'正在协处理'):'空闲';$('#detail').textContent=s.detail;$('#dot').className='dot '+(s.running?'run':'');$('#progress').textContent=indexing?(s.logs.at(-1)||'正在遍历 NAS 录像目录…'):s.running?(p.phase==='scanning'?`${p.percent??0}% · ${p.current_file||'正在准备'} · 文件 ${p.file_index||0}/${p.total_files||'?'} · 抽帧 ${p.samples||0}/${p.estimated_samples||'?'} · YOLO ${p.yolo_inferences||0} 次 · 剩余 ${duration(p.eta_seconds)}`:`正在准备下一批…`):'尚未开始';$('#logs').textContent=s.logs.join('\\n')||'尚无日志';$('#logs').scrollTop=$('#logs').scrollHeight;$('#index').disabled=s.running;$('#start').disabled=s.running}catch(e){$('#status').textContent='本地服务异常';$('#detail').textContent=e.message}}$('#index').onclick=async()=>{try{await api('/api/index',{method:'POST'});refresh()}catch(e){alert(e.message)}};$('#start').onclick=async()=>{try{const date=$('#date').value;if(!date)throw Error('请先建立索引，或等待现有索引读取完成');await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date,batches:+$('#batches').value,require_ac:$('#ac').checked})});refresh()}catch(e){alert(e.message)}};$('#stop').onclick=()=>api('/api/stop',{method:'POST'}).then(refresh);dates();refresh();setInterval(refresh,1500);setInterval(dates,5000)</script></html>"""
 
+PAGE = PAGE.replace(
+    '执行批数 <input id=batches type=number min=1 max=50 value=1>',
+    '本次最多处理未处理文件数 <input id=batches type=number min=1 max=250 value=5>',
+).replace(
+    '扫描会调用 Mac 的 MPS/Metal，每批最多处理 5 个未处理文件；结果写回 NAS，之后可在 NAS 管理页制作延时视频。',
+    '扫描会调用 Mac 的 MPS/Metal；已完成文件会自动跳过。本次填 5 就最多处理 5 个新文件，填 20 就最多处理 20 个；结果写回 NAS，之后可在 NAS 管理页制作延时视频。',
+).replace(
+    '正在准备下一批…',
+    '正在准备任务…',
+)
+
 
 def status():
     with LOCK:
@@ -90,13 +101,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(status())
         if self.path!='/api/start': return self.reply({'error':'not found'},HTTPStatus.NOT_FOUND)
         try:
-            data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))));date=data['date'];batches=int(data.get('batches',1));require_ac=bool(data.get('require_ac',True))
-            if not (date.isdigit() and len(date)==8 and 1<=batches<=50): raise ValueError('日期或批次数无效')
+            data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))));date=data['date'];limit=int(data.get('limit',data.get('batches',5)));require_ac=bool(data.get('require_ac',True))
+            if not (date.isdigit() and len(date)==8 and 1<=limit<=250): raise ValueError('日期或本次处理文件数无效')
             with LOCK:
                 if PROCESS and PROCESS.poll() is None: raise ValueError('已有任务正在运行')
-                LOGS.clear();LOGS.append(f'准备处理 {date}，共 {batches} 批。')
+                LOGS.clear();LOGS.append(f'准备处理 {date}，本次最多 {limit} 个未处理文件。')
             environment = dict(os.environ, REQUIRE_AC="1" if require_ac else "0")
-            command = ["sh", str(ROOT / "mac-worker.sh"), date, str(batches)]
+            command = ["sh", str(ROOT / "mac-worker.sh"), date, str(limit)]
             threading.Thread(target=run_process,args=("scan", command, environment),daemon=True).start();return self.reply(status())
         except (ValueError,json.JSONDecodeError) as error: return self.reply({'error':str(error)},HTTPStatus.BAD_REQUEST)
 

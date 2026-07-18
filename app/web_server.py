@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -141,12 +142,16 @@ def indexed_records(root, database):
         raise RuntimeError("另一台设备正在建立录像索引，请稍后重试")
     with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
         lock_file.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
+    backup_path = database.with_suffix(".sqlite3.bak")
+    if database.exists():
+        shutil.copy2(database, backup_path)
     connection = sqlite3.connect(database)
     connection.execute("""CREATE TABLE IF NOT EXISTS videos (
         path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
         camera TEXT NOT NULL, start TEXT NOT NULL, ending TEXT NOT NULL, seen TEXT NOT NULL)""")
     scan_id = uuid.uuid4().hex
     records, mp4_files = [], 0
+    previous_count = connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
     try:
         for path in root.rglob("*.mp4"):
             if not path.is_file():
@@ -174,6 +179,9 @@ def indexed_records(root, database):
                 record["size"] = stat.st_size
                 connection.execute("UPDATE videos SET seen=? WHERE path=?", (scan_id, relative))
                 records.append(record)
+        if previous_count and not mp4_files:
+            connection.rollback()
+            raise RuntimeError("本次未发现任何 MP4，已保留原有索引；请检查录像目录挂载。")
         connection.execute("DELETE FROM videos WHERE seen != ?", (scan_id,))
         connection.commit()
     finally:

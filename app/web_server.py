@@ -282,9 +282,10 @@ def task_command(task):
     command = [sys.executable, str(APP_ROOT / "person_timelapse.py")]
     if task["kind"] == "scan":
         settings = PROFILES[task["profile"]]
-        return command + ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", task["date"],
-                          "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
-                          "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
+        command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", task["date"],
+                    "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
+                    "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
+        return command + (["--force"] if task.get("force") else [])
     events = [str(OUTPUT_ROOT / f"events-{day}.json") for day in task["dates"]]
     return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
 
@@ -353,13 +354,15 @@ def task_worker(task_id, command, progress_file):
 def create_task(payload):
     kind = payload.get("kind")
     date = payload.get("date", "")
-    if kind not in {"scan", "export"} or not DATE_PATTERN.fullmatch(date):
+    if kind not in {"scan", "export", "timelapse"} or not DATE_PATTERN.fullmatch(date):
         raise ValueError("任务类型或日期无效")
     camera = payload.get("camera", "")
     profile = payload.get("profile", "balanced")
     if profile not in PROFILES:
         raise ValueError("性能档位无效")
-    if kind == "export" and not CAMERA_PATTERN.fullmatch(camera):
+    scan_requested = kind in {"scan", "timelapse"}
+    export_requested = kind in {"export", "timelapse"}
+    if export_requested and not CAMERA_PATTERN.fullmatch(camera):
         raise ValueError("导出任务需要摄像头编号")
     end_date = payload.get("end_date") or date
     if not DATE_PATTERN.fullmatch(end_date) or end_date < date:
@@ -375,41 +378,54 @@ def create_task(payload):
 
     with LOCK:
         tasks = load_tasks()
-        if kind == "scan":
+        if export_requested and any(
+            item.get("kind") == "export" and item.get("status") in {"queued", "running"}
+            and item.get("camera") == camera and item.get("dates") == dates
+            for item in tasks["tasks"]
+        ):
+            raise ValueError("这个日期范围的延时任务已在队列中。")
+        created, scan_created = [], 0
+        if scan_requested:
             active_days = {
                 day for item in tasks["tasks"]
                 if item.get("kind") == "scan" and item.get("status") in {"queued", "running"}
                 for day in item.get("dates", [item.get("date")])
             }
-            selected = [item for item in sorted(summaries, key=lambda item: item["date"])
-                        if item["scan_status"] not in {"completed", "queued", "scanning"}
-                        and item["date"] not in active_days]
-            if not selected:
+            selected = []
+            for item in sorted(summaries, key=lambda item: item["date"]):
+                event_exists = (OUTPUT_ROOT / f"events-{item['date']}.json").exists()
+                needs_scan = item["scan_status"] not in {"completed", "queued", "scanning"}
+                if kind == "timelapse":
+                    needs_scan = needs_scan or not event_exists
+                if needs_scan and item["date"] not in active_days:
+                    selected.append((item, item["scan_status"] == "completed" and not event_exists))
+            if kind == "scan" and not selected:
                 raise ValueError("这个范围内的录像均已完成扫描，或已在队列中。")
-            created = []
-            for item in selected:
+            for item, force in selected:
                 task = {
                     "id": uuid.uuid4().hex[:8], "kind": "scan", "date": item["date"],
                     "camera": None, "profile": profile, "status": "queued",
                     "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "detail": "等待扫描", "dates": [item["date"]],
+                    "detail": "等待扫描", "dates": [item["date"]], "force": force,
                 }
                 task["progress_file"] = f"progress-{task['id']}.json"
                 tasks["tasks"].append(task)
                 created.append(task)
-        else:
+                scan_created += 1
+        if export_requested:
             task = {
-                "id": uuid.uuid4().hex[:8], "kind": kind, "date": date,
+                "id": uuid.uuid4().hex[:8], "kind": "export", "date": date,
                 "camera": camera or None, "profile": None, "status": "queued",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
-                "detail": "等待导出", "dates": dates,
+                "detail": "等待范围扫描后导出" if kind == "timelapse" else "等待导出", "dates": dates,
             }
             task["progress_file"] = f"progress-{task['id']}.json"
             tasks["tasks"].append(task)
-            created = [task]
+            created.append(task)
         save_tasks(tasks)
     start_next_task()
-    return {"id": created[0]["id"], "created": len(created), "dates": dates}
+    return {"id": created[0]["id"], "created": len(created), "scan_created": scan_created,
+            "export_created": export_requested, "dates": dates}
 
 
 def cancel_task(task_id):

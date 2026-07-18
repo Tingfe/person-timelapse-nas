@@ -1,5 +1,6 @@
 import importlib
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -117,3 +118,18 @@ class ScanStatusTests(unittest.TestCase):
             finally:
                 WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
                 WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
+
+    def test_empty_mount_does_not_clear_existing_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, empty = root / "source", root / "empty"
+            source.mkdir()
+            empty.mkdir()
+            (source / "0_20260301010000_20260301020000.mp4").write_bytes(b"x")
+            database = root / "inventory.sqlite3"
+            WEB.indexed_records(source, database)
+            with self.assertRaisesRegex(RuntimeError, "未发现任何 MP4"):
+                WEB.indexed_records(empty, database)
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 1)
+            self.assertTrue(database.with_suffix(".sqlite3.bak").exists())

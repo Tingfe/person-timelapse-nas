@@ -133,3 +133,25 @@ class ScanStatusTests(unittest.TestCase):
             with sqlite3.connect(database) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 1)
             self.assertTrue(database.with_suffix(".sqlite3.bak").exists())
+
+    def test_refresh_keeps_cached_records_when_another_indexer_has_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "source", root / "output"
+            source.mkdir()
+            output.mkdir()
+            (source / "0_20260301010000_20260301020000.mp4").write_bytes(b"x")
+            database = output / "inventory.sqlite3"
+            WEB.indexed_records(source, database)
+            (output / ".inventory-index.lock").write_text("other device", encoding="utf-8")
+            original_input, original_output, original_database = WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH
+            original_inventory = WEB.INVENTORY.copy()
+            WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = source, output, database
+            WEB.INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": True}
+            try:
+                WEB.refresh_inventory()
+                self.assertEqual(len(WEB.INVENTORY["records"]), 1)
+                self.assertIn("另一台设备", WEB.INVENTORY["diagnostics"]["message"])
+            finally:
+                WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = original_input, original_output, original_database
+                WEB.INVENTORY = original_inventory

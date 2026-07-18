@@ -193,9 +193,30 @@ def indexed_records(root, database):
     return sorted(records, key=lambda item: item["start"]), mp4_files
 
 
+def cached_records(root, database):
+    """Load the last complete index immediately while a fresh scan runs in the background."""
+    if not database.exists():
+        return []
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute("SELECT path,size,camera,start,ending FROM videos").fetchall()
+    except sqlite3.Error:
+        return []
+    records = []
+    for relative, size, camera, start, ending in rows:
+        try:
+            records.append({"path": root / relative, "size": size, "camera": camera,
+                            "start": datetime.strptime(start, "%Y%m%d%H%M%S"),
+                            "end": datetime.strptime(ending, "%Y%m%d%H%M%S")})
+        except ValueError:
+            continue
+    return sorted(records, key=lambda item: item["start"])
+
+
 def refresh_inventory():
     """Build the expensive recursive index off the HTTP request path."""
     now = time.monotonic()
+    records = []
     try:
         if not INPUT_ROOT.is_dir():
             snapshot = {
@@ -205,6 +226,16 @@ def refresh_inventory():
             }
         else:
             children = sorted(path.name for path in INPUT_ROOT.iterdir())[:8]
+            records = cached_records(INPUT_ROOT, INVENTORY_DB_PATH)
+            if records:
+                with INVENTORY_LOCK:
+                    INVENTORY.update({
+                        "updated_at": now, "records": records,
+                        "diagnostics": {"path": str(INPUT_ROOT), "available": True,
+                                        "mp4_files": len(records), "recognized_files": len(records),
+                                        "index_database": str(INVENTORY_DB_PATH),
+                                        "message": "正在后台校验录像目录，当前显示上次完成的索引。"},
+                    })
             records, mp4_files = indexed_records(INPUT_ROOT, INVENTORY_DB_PATH)
             snapshot = {
                 "updated_at": now, "records": records,
@@ -214,7 +245,7 @@ def refresh_inventory():
                                 "examples": [str(record["path"].relative_to(INPUT_ROOT)) for record in records[:3]]},
             }
     except (OSError, RuntimeError) as error:  # A removable disk/share may disappear or another node owns the index.
-        snapshot = {"updated_at": now, "records": [],
+        snapshot = {"updated_at": now, "records": records,
                     "diagnostics": {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(), "message": str(error)}}
     with INVENTORY_LOCK:
         INVENTORY.update(snapshot)

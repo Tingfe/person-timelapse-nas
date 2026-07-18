@@ -87,3 +87,33 @@ class ScanStatusTests(unittest.TestCase):
             finally:
                 WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
                 WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
+
+    def test_one_click_timelapse_scans_missing_days_then_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output, original_tasks = WEB.OUTPUT_ROOT, WEB.TASKS_PATH
+            original_snapshot, original_start = WEB.inventory_snapshot, WEB.start_next_task
+            WEB.OUTPUT_ROOT, WEB.TASKS_PATH = output, output / "tasks.json"
+            records = [
+                {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
+                 "path": Path(f"{day}.mp4"), "size": day}
+                for day in (1, 3)
+            ]
+            WEB.inventory_snapshot = lambda: {"records": records}
+            WEB.start_next_task = lambda: None
+            try:
+                completed = records[0]
+                (output / "processed.json").write_text(json.dumps({"sources": {
+                    PROCESSOR.source_id(completed): {"processed_at": "2026-03-01T02:00:00"},
+                }}), encoding="utf-8")
+                (output / "events-20260301.json").write_text(json.dumps({"date": "20260301", "events": {}}), encoding="utf-8")
+                result = WEB.create_task({"kind": "timelapse", "date": "20260301", "end_date": "20260303",
+                                          "camera": "0", "profile": "archive"})
+                self.assertEqual(result["scan_created"], 1)
+                self.assertTrue(result["export_created"])
+                tasks = json.loads((output / "tasks.json").read_text(encoding="utf-8"))["tasks"]
+                self.assertEqual([task["kind"] for task in tasks], ["scan", "export"])
+                self.assertEqual(tasks[-1]["dates"], ["20260301", "20260303"])
+            finally:
+                WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
+                WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start

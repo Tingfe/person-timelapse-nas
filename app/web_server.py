@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -364,47 +364,52 @@ def create_task(payload):
     end_date = payload.get("end_date") or date
     if not DATE_PATTERN.fullmatch(end_date) or end_date < date:
         raise ValueError("结束日期无效")
-    dates = []
-    cursor = datetime.strptime(date, "%Y%m%d")
-    finish = datetime.strptime(end_date, "%Y%m%d")
-    while cursor <= finish:
-        dates.append(cursor.strftime("%Y%m%d"))
-        cursor += timedelta(days=1)
+    summaries = [item for item in available_dates(inventory_snapshot()) if date <= item["date"] <= end_date]
+    dates = [item["date"] for item in sorted(summaries, key=lambda item: item["date"])]
+    if not dates:
+        raise ValueError("该日期范围内没有已索引的录像。")
     if kind == "export":
         missing = [day for day in dates if not (OUTPUT_ROOT / f"events-{day}.json").exists()]
         if missing:
             raise ValueError(f"请先完成日期扫描：{missing[0]}{' 等' if len(missing) > 1 else ''}")
-    if kind == "scan":
-        summary = next((item for item in available_dates(inventory_snapshot()) if item["date"] == date), None)
-        if summary and summary["scan_status"] == "completed":
-            raise ValueError(f"{date} 已完成扫描，系统会自动跳过重复处理。")
-        if summary and summary["scan_status"] in {"queued", "scanning"}:
-            raise ValueError(f"{date} 已在任务队列中，无需重复添加。")
 
     with LOCK:
         tasks = load_tasks()
-        if kind == "scan" and any(
-            item.get("kind") == "scan" and item.get("status") in {"queued", "running"}
-            and date in item.get("dates", [item.get("date")])
-            for item in tasks["tasks"]
-        ):
-            raise ValueError(f"{date} 已在任务队列中，无需重复添加。")
-        task = {
-            "id": uuid.uuid4().hex[:8],
-            "kind": kind,
-            "date": date,
-            "camera": camera or None,
-            "profile": profile if kind == "scan" else None,
-            "status": "queued",
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "detail": "任务已启动",
-            "dates": dates,
-        }
-        task["progress_file"] = f"progress-{task['id']}.json"
-        tasks["tasks"].append(task)
+        if kind == "scan":
+            active_days = {
+                day for item in tasks["tasks"]
+                if item.get("kind") == "scan" and item.get("status") in {"queued", "running"}
+                for day in item.get("dates", [item.get("date")])
+            }
+            selected = [item for item in sorted(summaries, key=lambda item: item["date"])
+                        if item["scan_status"] not in {"completed", "queued", "scanning"}
+                        and item["date"] not in active_days]
+            if not selected:
+                raise ValueError("这个范围内的录像均已完成扫描，或已在队列中。")
+            created = []
+            for item in selected:
+                task = {
+                    "id": uuid.uuid4().hex[:8], "kind": "scan", "date": item["date"],
+                    "camera": None, "profile": profile, "status": "queued",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "detail": "等待扫描", "dates": [item["date"]],
+                }
+                task["progress_file"] = f"progress-{task['id']}.json"
+                tasks["tasks"].append(task)
+                created.append(task)
+        else:
+            task = {
+                "id": uuid.uuid4().hex[:8], "kind": kind, "date": date,
+                "camera": camera or None, "profile": None, "status": "queued",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "detail": "等待导出", "dates": dates,
+            }
+            task["progress_file"] = f"progress-{task['id']}.json"
+            tasks["tasks"].append(task)
+            created = [task]
         save_tasks(tasks)
     start_next_task()
-    return task
+    return {"id": created[0]["id"], "created": len(created), "dates": dates}
 
 
 def cancel_task(task_id):

@@ -42,3 +42,48 @@ class ScanStatusTests(unittest.TestCase):
             finally:
                 WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
 
+    def test_range_scan_queues_only_pending_recording_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output, original_tasks = WEB.OUTPUT_ROOT, WEB.TASKS_PATH
+            original_snapshot, original_start = WEB.inventory_snapshot, WEB.start_next_task
+            WEB.OUTPUT_ROOT, WEB.TASKS_PATH = output, output / "tasks.json"
+            records = [
+                {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
+                 "path": Path(f"{day}.mp4"), "size": day}
+                for day in (1, 3, 5)
+            ]
+            WEB.inventory_snapshot = lambda: {"records": records}
+            WEB.start_next_task = lambda: None
+            try:
+                result = WEB.create_task({"kind": "scan", "date": "20260301", "end_date": "20260305", "profile": "archive"})
+                self.assertEqual(result["created"], 3)
+                tasks = json.loads((output / "tasks.json").read_text(encoding="utf-8"))["tasks"]
+                self.assertEqual([task["date"] for task in tasks], ["20260301", "20260303", "20260305"])
+            finally:
+                WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
+                WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
+
+    def test_range_export_collects_only_recording_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output, original_tasks = WEB.OUTPUT_ROOT, WEB.TASKS_PATH
+            original_snapshot, original_start = WEB.inventory_snapshot, WEB.start_next_task
+            WEB.OUTPUT_ROOT, WEB.TASKS_PATH = output, output / "tasks.json"
+            records = [
+                {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
+                 "path": Path(f"{day}.mp4"), "size": day}
+                for day in (1, 3)
+            ]
+            WEB.inventory_snapshot = lambda: {"records": records}
+            WEB.start_next_task = lambda: None
+            try:
+                for day in ("20260301", "20260303"):
+                    (output / f"events-{day}.json").write_text(json.dumps({"date": day, "events": {}}), encoding="utf-8")
+                result = WEB.create_task({"kind": "export", "date": "20260301", "end_date": "20260303", "camera": "0"})
+                self.assertEqual(result["dates"], ["20260301", "20260303"])
+                task = json.loads((output / "tasks.json").read_text(encoding="utf-8"))["tasks"][0]
+                self.assertEqual(task["dates"], ["20260301", "20260303"])
+            finally:
+                WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
+                WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start

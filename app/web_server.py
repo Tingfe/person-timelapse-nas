@@ -31,6 +31,7 @@ MAC_PRIORITY_PATH = OUTPUT_ROOT / ".mac-priority.lock"
 PASSWORD_PATH = OUTPUT_ROOT / ".access-password"
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
+TIMELAPSE_PATTERN = re.compile(r"^people-timelapse-(\d+|legacy)-(\d{8})(?:-(\d{8}))?\.mp4$")
 LOCK = threading.Lock()
 INVENTORY_LOCK = threading.Lock()
 INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": False}
@@ -124,6 +125,29 @@ def event_summary(date, total_files=0, processed_files=0, scan_status="pending")
         "processed_files": processed_files,
         "scan_status": scan_status,
     }
+
+
+def timelapses():
+    """List finished videos once so the console can surface them as first-class results."""
+    items = []
+    for file in OUTPUT_ROOT.glob("people-timelapse-*.mp4"):
+        match = TIMELAPSE_PATTERN.fullmatch(file.name)
+        if not match:
+            continue
+        camera, start_date, end_date = match.groups()
+        try:
+            stat = file.stat()
+        except OSError:
+            continue
+        items.append({"name": file.name, "camera": camera, "start_date": start_date,
+                      "end_date": end_date or start_date, "size_bytes": stat.st_size,
+                      "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")})
+    return sorted(items, key=lambda item: item["created_at"], reverse=True)
+
+
+def exports_for_date(date, items=None):
+    return [item for item in (items if items is not None else timelapses())
+            if item["start_date"] <= date <= item["end_date"]]
 
 
 def indexed_records(root, database):
@@ -281,6 +305,7 @@ def available_dates(snapshot=None):
     result_days = {path.stem.removeprefix("events-") for path in OUTPUT_ROOT.glob("events-*.json")}
     processed_sources = set(load_ledger(OUTPUT_ROOT).get("sources", {}))
     active_days = {}
+    exported = timelapses()
     for task in load_tasks()["tasks"]:
         if task.get("kind") == "scan" and task.get("status") in {"queued", "running"}:
             for day in task.get("dates", [task["date"]]):
@@ -301,7 +326,9 @@ def available_dates(snapshot=None):
             scan_status = "completed"
         else:
             scan_status = "pending"
-        summaries.append(event_summary(day, total_files, processed_files, scan_status))
+        summary = event_summary(day, total_files, processed_files, scan_status)
+        summary["timelapse_count"] = len(exports_for_date(day, exported))
+        summaries.append(summary)
     return summaries
 
 
@@ -533,7 +560,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/overview":
             snapshot = inventory_snapshot()
-            self.send_json({"dates": available_dates(snapshot), "tasks": public_tasks(), "profiles": PROFILES,
+            self.send_json({"dates": available_dates(snapshot), "timelapses": timelapses(),
+                            "tasks": public_tasks(), "profiles": PROFILES,
                             "diagnostics": source_diagnostics(snapshot), "indexing": snapshot["indexing"]})
             return
         if path.startswith("/api/date/"):
@@ -542,8 +570,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 self.send_json({"error": "日期无效"}, HTTPStatus.BAD_REQUEST)
                 return
             events = read_json(OUTPUT_ROOT / f"events-{date}.json", {"date": date, "events": {}})
-            exports = [file.name for file in OUTPUT_ROOT.glob(f"people-timelapse-*-{date}.mp4")]
-            self.send_json({"events": events, "exports": sorted(exports)})
+            self.send_json({"events": events, "exports": exports_for_date(date)})
             return
         if path.startswith("/media/"):
             relative = Path(unquote(path.removeprefix("/media/")))

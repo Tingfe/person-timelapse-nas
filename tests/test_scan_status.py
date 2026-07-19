@@ -90,6 +90,27 @@ class ScanStatusTests(unittest.TestCase):
                 WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
                 WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
 
+    def test_timelapse_library_marks_every_day_in_a_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output = WEB.OUTPUT_ROOT
+            WEB.OUTPUT_ROOT = output
+            (output / "people-timelapse-0-20260301-20260303.mp4").write_bytes(b"video")
+            records = [
+                {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
+                 "path": Path(f"{day}.mp4"), "size": day}
+                for day in (1, 2, 3, 4)
+            ]
+            try:
+                self.assertEqual([item["name"] for item in WEB.exports_for_date("20260302")],
+                                 ["people-timelapse-0-20260301-20260303.mp4"])
+                summaries = {item["date"]: item for item in WEB.available_dates({"records": records})}
+                self.assertEqual(summaries["20260301"]["timelapse_count"], 1)
+                self.assertEqual(summaries["20260303"]["timelapse_count"], 1)
+                self.assertEqual(summaries["20260304"]["timelapse_count"], 0)
+            finally:
+                WEB.OUTPUT_ROOT = original_output
+
     def test_one_click_timelapse_scans_missing_days_then_exports(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

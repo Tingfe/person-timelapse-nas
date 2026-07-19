@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 
@@ -152,6 +153,25 @@ class ScanStatusTests(unittest.TestCase):
                 WEB.refresh_inventory()
                 self.assertEqual(len(WEB.INVENTORY["records"]), 1)
                 self.assertIn("另一台设备", WEB.INVENTORY["diagnostics"]["message"])
+            finally:
+                WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = original_input, original_output, original_database
+                WEB.INVENTORY = original_inventory
+
+    def test_refresh_ttl_starts_when_the_index_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "source", root / "output"
+            source.mkdir()
+            output.mkdir()
+            (source / "0_20260301010000_20260301020000.mp4").write_bytes(b"x")
+            original_input, original_output, original_database = WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH
+            original_inventory = WEB.INVENTORY.copy()
+            WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = source, output, output / "inventory.sqlite3"
+            WEB.INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": True}
+            try:
+                with patch.object(WEB.time, "monotonic", side_effect=[10.0, 51.0]):
+                    WEB.refresh_inventory()
+                self.assertEqual(WEB.INVENTORY["updated_at"], 51.0)
             finally:
                 WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = original_input, original_output, original_database
                 WEB.INVENTORY = original_inventory

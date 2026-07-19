@@ -247,6 +247,9 @@ def refresh_inventory():
     except (OSError, RuntimeError) as error:  # A removable disk/share may disappear or another node owns the index.
         snapshot = {"updated_at": now, "records": records,
                     "diagnostics": {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(), "message": str(error)}}
+    # A large NAS scan can take longer than the cache TTL.  Stamp completion
+    # time here, rather than its start time, to avoid immediately re-indexing.
+    snapshot["updated_at"] = time.monotonic()
     with INVENTORY_LOCK:
         INVENTORY.update(snapshot)
         INVENTORY["indexing"] = False

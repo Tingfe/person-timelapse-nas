@@ -32,8 +32,8 @@
   <script>
     const baseRender=render;
     const scanStateText=d=>{const count=d.total_files?` · ${d.processed_files}/${d.total_files} 文件`:'';return d.scan_status==='completed'?`已完成${count}`:d.scan_status==='partial'?`部分完成${count}`:d.scan_status==='scanning'?`扫描中${count}`:d.scan_status==='queued'?'已排队':'待扫描'};
-    render=()=>{baseRender();document.querySelectorAll('[data-date]').forEach(button=>{const day=overview.dates.find(item=>item.date===button.dataset.date),note=button.querySelector('small');if(!day)return;const badge=document.createElement('span');badge.className=`state ${day.scan_status}`;badge.textContent=scanStateText(day);note.before(badge);note.textContent=day.events?`${day.events} 个事件 · ${day.cameras.join('/')} 路`:'尚未检测到人物事件'});const selectedDay=overview.dates.find(item=>item.date===$('#dateSelect').value.replaceAll('-',''));$('#scan').disabled=!!active()||overview.indexing||['completed','queued','scanning'].includes(selectedDay?.scan_status)};
-    const renderWithStates=render;render=()=>{renderWithStates();$('#timelapse').disabled=!!active()||overview.indexing};
+    render=()=>{baseRender();document.querySelectorAll('[data-date]').forEach(button=>{const day=overview.dates.find(item=>item.date===button.dataset.date),note=button.querySelector('small');if(!day)return;const badge=document.createElement('span');badge.className=`state ${day.scan_status}`;badge.textContent=scanStateText(day);note.before(badge);note.textContent=day.events?`${day.events} 个事件 · ${day.cameras.join('/')} 路`:'尚未检测到人物事件'});const selectedDay=overview.dates.find(item=>item.date===$('#dateSelect').value.replaceAll('-',''));$('#scan').disabled=!!active()||['completed','queued','scanning'].includes(selectedDay?.scan_status)};
+    const renderWithStates=render;render=()=>{renderWithStates();$('#timelapse').disabled=!!active()};
     const archiveProfile=document.querySelector('#profile');if(!archiveProfile.querySelector('[value="archive"]'))archiveProfile.insertAdjacentHTML('afterbegin','<option value="archive">超极速（历史回放）· 120 秒抽帧 · 256px</option>');
   </script>
 </body>

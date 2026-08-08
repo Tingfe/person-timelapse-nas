@@ -137,9 +137,34 @@ class ScanStatusTests(unittest.TestCase):
                 tasks = json.loads((output / "tasks.json").read_text(encoding="utf-8"))["tasks"]
                 self.assertEqual([task["kind"] for task in tasks], ["scan", "export"])
                 self.assertEqual(tasks[-1]["dates"], ["20260301", "20260303"])
+                self.assertEqual(tasks[-1]["depends_on"], [tasks[0]["id"]])
             finally:
                 WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
                 WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
+
+    def test_export_is_blocked_when_its_scan_dependency_fails(self):
+        tasks = [
+            {"id": "scan-1", "kind": "scan", "date": "20260301", "status": "failed"},
+            {"id": "export-1", "kind": "export", "date": "20260301", "status": "queued",
+             "depends_on": ["scan-1"]},
+        ]
+        self.assertEqual(WEB.dependency_state(tasks[1], tasks)[0], "error")
+        self.assertIn("20260301", WEB.dependency_state(tasks[1], tasks)[1])
+
+    def test_export_validation_explains_camera_without_person_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output = WEB.OUTPUT_ROOT
+            WEB.OUTPUT_ROOT = output
+            (output / "events-20260301.json").write_text(
+                json.dumps({"date": "20260301", "events": {"10": [{"start": "2026-03-01T01:00:00", "end": "2026-03-01T01:01:00"}]}}),
+                encoding="utf-8",
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "0 路的人物事件"):
+                    WEB.validate_export_task({"dates": ["20260301"], "camera": "0"})
+            finally:
+                WEB.OUTPUT_ROOT = original_output
 
     def test_empty_mount_does_not_clear_existing_index(self):
         with tempfile.TemporaryDirectory() as directory:

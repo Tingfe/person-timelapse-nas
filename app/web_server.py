@@ -103,7 +103,10 @@ def session_from_headers(headers):
 
 
 def public_tasks():
-    tasks = load_tasks()["tasks"][:20]
+    tasks = load_tasks()["tasks"]
+    active = [task for task in tasks if task.get("status") in {"queued", "running", "blocked"}]
+    finished = [task for task in tasks if task not in active]
+    tasks = active + list(reversed(finished))[:max(0, 20 - len(active))]
     result = []
     for task in tasks:
         item = dict(task)
@@ -359,6 +362,37 @@ def task_command(task):
     return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
 
 
+def dependency_state(task, tasks):
+    """Return ready/wait/error state for a queued task with explicit prerequisites."""
+    dependencies = task.get("depends_on", [])
+    if not dependencies:
+        return "ready", ""
+    by_id = {item.get("id"): item for item in tasks}
+    missing = [task_id for task_id in dependencies if task_id not in by_id]
+    if missing:
+        return "error", "前置扫描任务记录缺失，无法安全导出。"
+    failed = [by_id[task_id] for task_id in dependencies
+              if by_id[task_id].get("status") in {"failed", "cancelled", "interrupted", "blocked"}]
+    if failed:
+        days = "、".join(item.get("date", "未知日期") for item in failed)
+        return "error", f"前置扫描未成功（{days}），范围延时未执行。"
+    if any(by_id[task_id].get("status") != "completed" for task_id in dependencies):
+        return "waiting", "等待范围内的扫描任务完成"
+    return "ready", ""
+
+
+def validate_export_task(task):
+    missing = [day for day in task["dates"] if not (OUTPUT_ROOT / f"events-{day}.json").exists()]
+    if missing:
+        raise RuntimeError(f"缺少人物扫描结果：{missing[0]}{' 等' if len(missing) > 1 else ''}")
+    event_count = 0
+    for day in task["dates"]:
+        events = read_json(OUTPUT_ROOT / f"events-{day}.json", {"events": {}})
+        event_count += len(events.get("events", {}).get(task["camera"], []))
+    if not event_count:
+        raise RuntimeError(f"所选范围内没有 {task['camera']} 路的人物事件；请切换摄像头后重新制作。")
+
+
 def mac_priority_active():
     """Mac worker renews this lease every minute while it owns compute priority."""
     try:
@@ -371,24 +405,47 @@ def mac_priority_active():
 
 
 def start_next_task():
-    with LOCK:
-        if mac_priority_active():
-            return
-        tasks = load_tasks()
-        if any(task["status"] == "running" for task in tasks["tasks"]):
-            return
-        task = next((item for item in tasks["tasks"] if item["status"] == "queued"), None)
-        if not task:
-            return
-        task["status"] = "running"
-        task["started_at"] = datetime.now().isoformat(timespec="seconds")
-        task["detail"] = "任务已启动"
-        save_tasks(tasks)
-    thread = threading.Thread(target=task_worker, args=(task["id"], task_command(task), task["progress_file"]), daemon=True)
+    while True:
+        with LOCK:
+            if mac_priority_active():
+                return
+            tasks = load_tasks()
+            if any(task["status"] == "running" for task in tasks["tasks"]):
+                return
+            changed, task = False, None
+            for candidate in tasks["tasks"]:
+                if candidate.get("status") != "queued":
+                    continue
+                state, detail = dependency_state(candidate, tasks["tasks"])
+                if state == "waiting":
+                    if candidate.get("detail") != detail:
+                        candidate["detail"] = detail
+                        changed = True
+                    continue
+                if state == "error":
+                    candidate["status"] = "blocked"
+                    candidate["detail"] = detail
+                    candidate["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    changed = True
+                    continue
+                task = candidate
+                task["status"] = "running"
+                task["started_at"] = datetime.now().isoformat(timespec="seconds")
+                task["detail"] = "任务已启动"
+                changed = True
+                break
+            if changed:
+                save_tasks(tasks)
+            if task:
+                break
+            if not changed:
+                return
+    thread = threading.Thread(target=task_worker, args=(task, task_command(task), task["progress_file"]), daemon=True)
     thread.start()
 
 
-def task_worker(task_id, command, progress_file):
+def task_worker(task, command, progress_file):
+    task_id = task["id"]
     environment = os.environ.copy()
     progress_path = OUTPUT_ROOT / progress_file
     environment["PROGRESS_PATH"] = str(progress_path)
@@ -400,6 +457,8 @@ def task_worker(task_id, command, progress_file):
     })
     process = None
     try:
+        if task["kind"] == "export":
+            validate_export_task(task)
         process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
         PROCESSES[task_id] = process
         detail, _ = process.communicate()
@@ -454,9 +513,10 @@ def create_task(payload):
         ):
             raise ValueError("这个日期范围的延时任务已在队列中。")
         created, scan_created = [], 0
+        dependency_ids = []
         if scan_requested:
-            active_days = {
-                day for item in tasks["tasks"]
+            active_scans = {
+                day: item for item in tasks["tasks"]
                 if item.get("kind") == "scan" and item.get("status") in {"queued", "running"}
                 for day in item.get("dates", [item.get("date")])
             }
@@ -466,7 +526,10 @@ def create_task(payload):
                 needs_scan = item["scan_status"] not in {"completed", "queued", "scanning"}
                 if kind == "timelapse":
                     needs_scan = needs_scan or not event_exists
-                if needs_scan and item["date"] not in active_days:
+                active_task = active_scans.get(item["date"])
+                if active_task:
+                    dependency_ids.append(active_task["id"])
+                elif needs_scan:
                     selected.append((item, item["scan_status"] == "completed" and not event_exists))
             if kind == "scan" and not selected:
                 raise ValueError("这个范围内的录像均已完成扫描，或已在队列中。")
@@ -481,12 +544,14 @@ def create_task(payload):
                 tasks["tasks"].append(task)
                 created.append(task)
                 scan_created += 1
+                dependency_ids.append(task["id"])
         if export_requested:
             task = {
                 "id": uuid.uuid4().hex[:8], "kind": "export", "date": date,
                 "camera": camera or None, "profile": None, "status": "queued",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "detail": "等待范围扫描后导出" if kind == "timelapse" else "等待导出", "dates": dates,
+                "depends_on": sorted(set(dependency_ids)),
             }
             task["progress_file"] = f"progress-{task['id']}.json"
             tasks["tasks"].append(task)

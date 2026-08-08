@@ -393,6 +393,14 @@ def validate_export_task(task):
         raise RuntimeError(f"所选范围内没有 {task['camera']} 路的人物事件；请切换摄像头后重新制作。")
 
 
+def resolve_camera(summaries, requested_camera):
+    """Prefer the only camera that actually has person events in a range."""
+    cameras = {camera for summary in summaries for camera in summary.get("cameras", [])}
+    if requested_camera not in cameras and len(cameras) == 1:
+        return cameras.pop()
+    return requested_camera
+
+
 def mac_priority_active():
     """Mac worker renews this lease every minute while it owns compute priority."""
     try:
@@ -499,6 +507,8 @@ def create_task(payload):
     dates = [item["date"] for item in sorted(summaries, key=lambda item: item["date"])]
     if not dates:
         raise ValueError("该日期范围内没有已索引的录像。")
+    if export_requested:
+        camera = resolve_camera(summaries, camera)
     if kind == "export":
         missing = [day for day in dates if not (OUTPUT_ROOT / f"events-{day}.json").exists()]
         if missing:
@@ -559,7 +569,7 @@ def create_task(payload):
         save_tasks(tasks)
     start_next_task()
     return {"id": created[0]["id"], "created": len(created), "scan_created": scan_created,
-            "export_created": export_requested, "dates": dates}
+            "export_created": export_requested, "dates": dates, "camera": camera}
 
 
 def cancel_task(task_id):

@@ -166,6 +166,28 @@ class ScanStatusTests(unittest.TestCase):
             finally:
                 WEB.OUTPUT_ROOT = original_output
 
+    def test_export_uses_the_only_camera_with_events_in_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            original_output, original_tasks = WEB.OUTPUT_ROOT, WEB.TASKS_PATH
+            original_snapshot, original_start = WEB.inventory_snapshot, WEB.start_next_task
+            WEB.OUTPUT_ROOT, WEB.TASKS_PATH = output, output / "tasks.json"
+            records = [{"camera": "legacy", "start": datetime(2024, 10, 1, 1),
+                        "end": datetime(2024, 10, 1, 2), "path": Path("legacy.mp4"), "size": 1}]
+            WEB.inventory_snapshot, WEB.start_next_task = lambda: {"records": records}, lambda: None
+            (output / "events-20241001.json").write_text(
+                json.dumps({"date": "20241001", "events": {"legacy": [{"start": "2024-10-01T01:00:00", "end": "2024-10-01T01:01:00"}]}}),
+                encoding="utf-8",
+            )
+            try:
+                result = WEB.create_task({"kind": "export", "date": "20241001", "camera": "0"})
+                task = json.loads((output / "tasks.json").read_text(encoding="utf-8"))["tasks"][0]
+                self.assertEqual(result["camera"], "legacy")
+                self.assertEqual(task["camera"], "legacy")
+            finally:
+                WEB.OUTPUT_ROOT, WEB.TASKS_PATH = original_output, original_tasks
+                WEB.inventory_snapshot, WEB.start_next_task = original_snapshot, original_start
+
     def test_empty_mount_does_not_clear_existing_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

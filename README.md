@@ -192,7 +192,7 @@ python /opt/person-timelapse/person_timelapse.py export /input /output \
 
 推送到 `main` 后，GitHub Actions 会先运行可靠性回归测试，通过后才构建 ARM64 镜像并发布 `latest` 与 `sha-提交哈希` 标签。维护者需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`；使用者不需要任何 Docker Hub 凭据。
 
-Docker Hub 的短介绍与 Overview 由独立的 `Sync Docker Hub overview` 流程维护：README 修改后自动同步，也可在 Actions 中手动运行。它复用上述 Secrets，不重建镜像；发布后读回内容校验，失败会明确报错。Docker Hub 上的文档链接会自动指向 GitHub，不依赖相对路径。发布流程会屏蔽事件中的邮箱，并关闭包含额外构建元数据的公开构建记录附件；不要在流水线中打印完整环境变量、事件或凭据。
+Docker Hub 的短介绍与 Overview 由独立的 `Sync Docker Hub overview` 流程维护：README 修改后自动同步，也可在 Actions 中手动运行。它复用上述 Secrets，不重建镜像；发布后读回内容校验，失败会明确报错。Docker Hub 上的文档链接会自动指向 GitHub，不依赖相对路径。镜像明确使用最小来源证明（`provenance: mode=min`），屏蔽发布事件中的邮箱，并关闭包含额外构建元数据的公开构建记录附件；不要在流水线中打印完整环境变量、事件或凭据。
 
 维护者也可手动运行 `Audit public image privacy`，只读检查公开镜像所有标签的配置、来源证明及应用代码层。检查结果不打印命中的邮箱或凭据；它不下载或审查第三方运行时大层，也不能代替完整的人工安全审计。
 

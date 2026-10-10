@@ -56,6 +56,8 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
+          # Public repositories otherwise default to max provenance, which includes event metadata.
+          provenance: mode=min
           # Inline cache survives between runners without a separate cache tag.
           # Keep the default compression so existing NAS layers remain reusable.
           cache-from: type=registry,ref=${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:latest

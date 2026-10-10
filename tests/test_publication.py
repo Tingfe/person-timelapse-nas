@@ -52,4 +52,5 @@ class OverviewPublicationTests(unittest.TestCase):
         source = (ROOT / ".github/workflows/dockerhub.yml").read_text(encoding="utf-8")
         self.assertLess(source.index("Mask personal email"), source.index("actions/checkout"))
         self.assertIn('DOCKER_BUILD_RECORD_UPLOAD: "false"', source)
+        self.assertIn("provenance: mode=min", source)
         self.assertIn("::add-mask::", source)

@@ -36,7 +36,8 @@ class MediaIntegrationTests(unittest.TestCase):
 
     def test_multi_day_streaming_export_and_library(self):
         events = [(r["start"], r["end"]) for r in self.records]
-        self.assertEqual(P.export(self.records, events, self.output, "0", "20240101-20240102", 1, 4), 0)
+        # Deliberate duplicates also verify overlap deduplication and ordering.
+        self.assertEqual(P.export(list(reversed(self.records)) * 2, events, self.output, "0", "20240101-20240102", 1, 4), 0)
         target = self.output / "people-timelapse-0-20240101-20240102.mp4"
         self.assertTrue(P.valid_video(target))
         self.assertEqual(json.loads(target.with_suffix(".json").read_text())["frames"], 8)

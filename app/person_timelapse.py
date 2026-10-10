@@ -406,7 +406,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     import cv2
 
     output_root.mkdir(parents=True, exist_ok=True)
-    candidates = [record for record in records if record["camera"] == camera]
+    candidates = sorted((record for record in records if record["camera"] == camera), key=lambda record: record["start"])
     if not selected_events:
         raise SystemExit(f"camera {camera} has no events to export")
     started = time.monotonic()
@@ -425,6 +425,9 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             count = 0
             written_moments = set()
             for record_index, record in enumerate(candidates, start=1):
+                # Only overlapping recordings can repeat a frame. Keeping the
+                # entire year's timestamps would grow memory with every frame.
+                written_moments = {moment for moment in written_moments if moment >= record["start"]}
                 relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
                 if not relevant:
                     continue
@@ -447,7 +450,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
                             report_progress(phase="exporting", percent=round(record_index / max(len(candidates), 1) * 90, 1),
                                             current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
                                             frames=count, elapsed_seconds=round(time.monotonic() - started, 1))
-                            moment_key = (record["start"] + timedelta(seconds=offset)).isoformat()
+                            moment_key = record["start"] + timedelta(seconds=offset)
                             if moment_key not in written_moments:
                                 capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
                                 ok, frame = capture.read()

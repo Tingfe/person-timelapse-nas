@@ -2,6 +2,7 @@
 import importlib
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -62,6 +63,21 @@ class MediaIntegrationTests(unittest.TestCase):
             exported = W.timelapses()[0]
             self.assertEqual(exported["status"], "partial")
             self.assertEqual(exported["scan_failed_files"], 1)
+
+    def test_hevc_keyframe_sampling_preserves_tail_and_accurate_mode(self):
+        import cv2
+        import numpy as np
+        file = self.root / "long-gop.mp4"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=160x96:rate=10:duration=8", "-c:v", "libx265", "-preset", "ultrafast",
+                        "-x265-params", "keyint=20:min-keyint=20:scenecut=0:pools=1:frame-threads=1:log-level=error",
+                        str(file)], check=True, capture_output=True, timeout=30)
+        frames = P.decode_export_frames(file, 0, 1, 8, lambda: None, mode="keyframes")
+        self.assertEqual(len(frames), 8)
+        self.assertTrue(all(cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR) is not None
+                            for frame in frames))
+        exact = P.decode_export_frames(file, 1.1, .5, 3, lambda: None, mode="accurate")
+        self.assertEqual(len(exact), 3)
 
 
 if __name__ == "__main__":

@@ -401,10 +401,63 @@ def valid_video(path):
         return False
 
 
+def decode_export_frames(path, offset, frame_seconds, frame_count, heartbeat, mode=None):
+    # Seek once per bounded batch, not once per output picture. On small ARM
+    # NAS CPUs, decoding every 3K HEVC frame just to retain 1 fps is prohibitive.
+    mode = mode or os.environ.get("EXPORT_DECODE_MODE", "keyframes")
+    if mode not in {"keyframes", "accurate"}:
+        raise ValueError("EXPORT_DECODE_MODE must be keyframes or accurate")
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2"]
+    if mode == "keyframes":
+        command += ["-skip_frame", "nokey"]
+    command += ["-ss", str(offset), "-i", str(path), "-map", "0:v:0", "-an",
+                "-vf", f"fps=1/{frame_seconds}:start_time=0:round=up:eof_action=pass,scale=1280:-2",
+                "-frames:v", str(frame_count), "-threads", "2", "-c:v", "mjpeg", "-q:v", "3",
+                "-f", "image2pipe", "pipe:1"]
+    started = time.monotonic()
+    timeout = float(os.environ.get("EXPORT_DECODE_TIMEOUT_SECONDS", "120"))
+    with tempfile.TemporaryFile() as errors:
+        decoder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            while True:
+                if time.monotonic() - started >= timeout:
+                    raise RuntimeError(f"视频抽帧超时（{timeout:g} 秒）")
+                try:
+                    data, _ = decoder.communicate(timeout=2)
+                    break
+                except subprocess.TimeoutExpired:
+                    heartbeat()
+            if decoder.returncode:
+                errors.seek(0)
+                raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-1000:] or "视频抽帧失败")
+        finally:
+            if decoder.poll() is None:
+                decoder.kill()
+                decoder.wait(timeout=10)
+            decoder.stdout.close()
+    # FFmpeg's MJPEG output has no embedded thumbnails. Keep only complete
+    # JPEGs; a truncated batch is disclosed by the caller as a partial export.
+    frames = []
+    position = 0
+    while len(frames) < frame_count:
+        start = data.find(b"\xff\xd8", position)
+        end = data.find(b"\xff\xd9", start + 2) if start >= 0 else -1
+        if end < 0:
+            break
+        frames.append(data[start:end + 2])
+        position = end + 2
+    if mode == "keyframes" and len(frames) < frame_count:
+        # The last GOP may contain no more keyframes, even though readable
+        # pictures remain. Decode only that missing tail precisely.
+        frames += decode_export_frames(path, offset + len(frames) * frame_seconds,
+                                       frame_seconds, frame_count - len(frames), heartbeat, mode="accurate")
+    return frames
+
+
 def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int,
            scan_failed_files=0):
-    import cv2
-
+    if not math.isfinite(frame_seconds) or frame_seconds <= 0 or fps <= 0:
+        raise ValueError("抽帧间隔与输出帧率必须大于零")
     output_root.mkdir(parents=True, exist_ok=True)
     candidates = sorted((record for record in records if record["camera"] == camera), key=lambda record: record["start"])
     if not selected_events:
@@ -420,7 +473,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             process = subprocess.Popen([
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "image2pipe", "-vcodec", "mjpeg",
                 "-framerate", str(fps), "-i", "pipe:0", "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "26",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary,
+                "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary,
             ], stdin=subprocess.PIPE, stderr=errors)
             count = 0
             written_moments = set()
@@ -431,41 +484,40 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
                 relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
                 if not relevant:
                     continue
-                report_progress(
-                    phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
-                    current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
-                    frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None,
-                )
-                capture = cv2.VideoCapture(str(record["path"]))
-                try:
-                    if not capture.isOpened():
-                        failed_files.add(record["path"].name)
-                        continue
-                    for event_start, event_end in relevant:
-                        start = max(record["start"], event_start)
-                        end = min(record["end"], event_end)
-                        offset = (start - record["start"]).total_seconds()
-                        stop = (end - record["start"]).total_seconds()
-                        while offset < stop:
-                            report_progress(phase="exporting", percent=round(record_index / max(len(candidates), 1) * 90, 1),
-                                            current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
-                                            frames=count, elapsed_seconds=round(time.monotonic() - started, 1))
-                            moment_key = record["start"] + timedelta(seconds=offset)
-                            if moment_key not in written_moments:
-                                capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
-                                ok, frame = capture.read()
-                                if ok:
-                                    written_moments.add(moment_key)
-                                    ok, encoded = cv2.imencode(".jpg", frame)
-                                    if not ok:
-                                        raise RuntimeError("无法编码延时帧")
-                                    process.stdin.write(encoded.tobytes())
+
+                def heartbeat():
+                    report_progress(phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
+                                    current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
+                                    frames=count, failed_files=len(failed_files),
+                                    decode_mode=os.environ.get("EXPORT_DECODE_MODE", "keyframes"),
+                                    elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None)
+
+                heartbeat()
+                for event_start, event_end in sorted(relevant):
+                    start = max(record["start"], event_start)
+                    end = min(record["end"], event_end)
+                    offset = (start - record["start"]).total_seconds()
+                    stop = (end - record["start"]).total_seconds()
+                    while offset < stop:
+                        batch_count = max(1, min(30, math.ceil((stop - offset) / frame_seconds - 1e-9)))
+                        moments = [record["start"] + timedelta(seconds=offset + i * frame_seconds)
+                                   for i in range(batch_count)]
+                        if any(moment not in written_moments for moment in moments):
+                            try:
+                                frames = decode_export_frames(record["path"], offset, frame_seconds, batch_count, heartbeat)
+                            except (OSError, RuntimeError) as error:
+                                print(f"export read failed: {record['path'].name} @ {offset:g}s: {error}",
+                                      file=sys.stderr, flush=True)
+                                frames = []
+                            if len(frames) < batch_count:
+                                failed_files.add(record["path"].name)
+                            for moment, frame in zip(moments, frames):
+                                if moment not in written_moments:
+                                    process.stdin.write(frame)
+                                    written_moments.add(moment)
                                     count += 1
-                                else:
-                                    failed_files.add(record["path"].name)
-                            offset += frame_seconds
-                finally:
-                    capture.release()
+                        offset += batch_count * frame_seconds
+                        heartbeat()
             if not count:
                 raise RuntimeError("所选事件未能读取任何画面，原有成片已保留")
             process.stdin.close()
@@ -479,7 +531,8 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             stat = target.stat()
             atomic_json(target.with_suffix(".json"), {"status": "partial" if failed_files or scan_failed_files else "completed",
                         "failed_files": sorted(failed_files), "scan_failed_files": scan_failed_files, "frames": count, "fps": fps,
-                        "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "validated": True})
+                        "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "validated": True,
+                        "decode_mode": os.environ.get("EXPORT_DECODE_MODE", "keyframes")})
     finally:
         if process and process.poll() is None:
             process.kill()

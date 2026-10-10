@@ -213,14 +213,70 @@ class ReliabilityTests(unittest.TestCase):
         target.write_bytes(b"previous good video")
         process = MagicMock()
         process.wait.return_value, process.poll.return_value = 1, 1
-        cv = SimpleNamespace(VideoCapture=lambda _: SimpleNamespace(isOpened=lambda: True,
-                             set=lambda *args: True, read=lambda: (True, object()), release=lambda: None),
-                             CAP_PROP_POS_MSEC=3, imencode=lambda *args: (True, SimpleNamespace(tobytes=lambda: b"jpeg")))
-        with patch.dict(sys.modules, {"cv2": cv}), patch.object(P.subprocess, "Popen", return_value=process):
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 12), \
+                patch.object(P.subprocess, "Popen", return_value=process):
             with self.assertRaises(RuntimeError):
                 P.export([record], [(record["start"], record["end"])], self.output, "0", "20240101", 5, 25)
         self.assertEqual(target.read_bytes(), b"previous good video")
         self.assertEqual(list(self.output.glob("*.partial.mp4")), [])
+
+    def test_export_decodes_contiguous_frames_in_batches_not_individual_seeks(self):
+        record = self.record()
+        encoder = MagicMock()
+        encoder.wait.return_value, encoder.poll.return_value = 0, 0
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 30) as decode, \
+                patch.object(P.subprocess, "Popen", return_value=encoder), \
+                patch.object(P, "valid_video", return_value=True):
+            P.export([record], [(record["start"], record["end"])], self.output, "0", "20240101", 1, 25)
+        self.assertEqual(decode.call_count, 2)
+        self.assertEqual([call.args[1:4] for call in decode.call_args_list], [(0.0, 1, 30), (30.0, 1, 30)])
+        self.assertEqual(encoder.stdin.write.call_count, 60)
+
+    def test_export_decode_failure_is_partial_and_does_not_mark_missing_frames_written(self):
+        record = self.record()
+        encoder = MagicMock()
+        encoder.wait.return_value, encoder.poll.return_value = 0, 0
+        with patch.object(P, "decode_export_frames", side_effect=[RuntimeError("timeout"), [b"jpeg"] * 30]), \
+                patch.object(P.subprocess, "Popen", return_value=encoder), \
+                patch.object(P, "valid_video", return_value=True):
+            self.assertEqual(P.export([record], [(record["start"], record["end"])],
+                                     self.output, "0", "20240101", 1, 25), 2)
+        metadata = json.loads((self.output / "people-timelapse-0-20240101.json").read_text())
+        self.assertEqual(metadata["frames"], 30)
+        self.assertEqual(metadata["failed_files"], [record["path"].name])
+
+    def test_export_decoder_timeout_kills_child_and_keeps_heartbeat_alive(self):
+        decoder = MagicMock()
+        decoder.poll.return_value = None
+        decoder.communicate.side_effect = subprocess.TimeoutExpired("ffmpeg", 2)
+        with patch.object(P.subprocess, "Popen", return_value=decoder), \
+                patch.object(P.time, "monotonic", side_effect=[0, 0, 31]), \
+                patch.dict(os.environ, {"EXPORT_DECODE_TIMEOUT_SECONDS": "30"}):
+            heartbeat = MagicMock()
+            with self.assertRaisesRegex(RuntimeError, "超时"):
+                P.decode_export_frames(Path("sample.mp4"), 115, 1, 10, heartbeat)
+        decoder.kill.assert_called_once()
+        decoder.wait.assert_called_once()
+        self.assertTrue(heartbeat.called)
+
+    def test_export_decoder_uses_input_seek_and_returns_only_complete_frames(self):
+        decoder = MagicMock()
+        decoder.communicate.return_value = (b"\xff\xd8frame\xff\xd9", b"")
+        decoder.returncode, decoder.poll.return_value = 0, 0
+        with patch.object(P.subprocess, "Popen", return_value=decoder) as popen:
+            frames = P.decode_export_frames(Path("sample.mp4"), 115, 1, 2, lambda: None, mode="accurate")
+        command = popen.call_args.args[0]
+        self.assertLess(command.index("-ss"), command.index("-i"))
+        self.assertEqual(len(frames), 1)
+
+    def test_export_decoder_interruption_cleans_up_child(self):
+        decoder = MagicMock()
+        decoder.poll.return_value = None
+        decoder.communicate.side_effect = SystemExit()
+        with patch.object(P.subprocess, "Popen", return_value=decoder), self.assertRaises(SystemExit):
+            P.decode_export_frames(Path("sample.mp4"), 0, 1, 10, lambda: None)
+        decoder.kill.assert_called_once()
+        decoder.stdout.close.assert_called_once()
 
     def test_legacy_point_event_gets_playable_context(self):
         file = self.output / "events-20240101.json"

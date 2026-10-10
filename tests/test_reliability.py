@@ -264,6 +264,109 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual([t["status"] for t in recovered], ["queued", "queued"])
             self.assertEqual(recovered[1]["depends_on"], ["scan"])
 
+    def test_legacy_task_migration_is_backed_up_and_idempotent(self):
+        original = {"paused": True, "plans": [{"id": "plan", "scan_ids": ["old-scan"]}], "tasks": [
+            {"id": "old-scan", "kind": "scan", "date": "20240101", "status": "running"},
+            {"id": "old-export", "kind": "export", "date": "20240101", "camera": "0",
+             "status": "queued", "depends_on": ["old-scan"]},
+            {"id": "done", "kind": "scan", "date": "20240102", "status": "completed", "profile": "precise"},
+        ]}
+        with self.web_roots():
+            W.save_tasks(original)
+            W.recover_interrupted_tasks()
+            saved = W.load_tasks()
+            first, export, done = saved["tasks"]
+            self.assertEqual(first["profile"], "turbo")
+            self.assertEqual(first["progress_file"], "progress-old-scan.json")
+            self.assertEqual(first["dates"], ["20240101"])
+            self.assertIsNone(first["camera"])
+            self.assertEqual(export["dates"], ["20240101"])
+            self.assertEqual(export["depends_on"], ["old-scan"])
+            self.assertEqual((done["status"], done["profile"]), ("completed", "precise"))
+            self.assertEqual(saved["plans"], original["plans"])
+            self.assertTrue(saved["paused"])
+            backups = list(self.output.glob("tasks.pre-migration-*.json"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(json.loads(backups[0].read_text()), original)
+            W.recover_interrupted_tasks()
+            self.assertEqual(W.load_tasks(), saved)
+            self.assertEqual(list(self.output.glob("tasks.pre-migration-*.json")), backups)
+
+    def test_scheduler_can_start_legacy_scan_without_startup_recovery(self):
+        with self.web_roots(), patch.object(W, "mac_priority_active", return_value=False), \
+                patch.object(W.threading, "Thread") as worker:
+            W.save_tasks({"tasks": [{"id": "legacy-scan", "kind": "scan", "date": "20240101", "status": "queued"}]})
+            W.start_next_task()
+            worker.return_value.start.assert_called_once()
+            task, _, progress = worker.call_args.kwargs["args"]
+            self.assertEqual(progress, "progress-legacy-scan.json")
+            self.assertIn("30", W.task_command(task))
+            self.assertEqual(W.load_tasks()["tasks"][0]["status"], "running")
+
+    def test_bad_task_configuration_does_not_block_next_task(self):
+        with self.web_roots(), patch.object(W, "mac_priority_active", return_value=False), \
+                patch.object(W.threading, "Thread") as worker:
+            W.save_tasks({"tasks": [
+                {"id": "bad", "kind": "scan", "date": "20240101", "status": "queued", "profile": "unknown"},
+                {"id": "good", "kind": "scan", "date": "20240102", "status": "queued"},
+            ]})
+            W.start_next_task()
+            tasks = W.load_tasks()["tasks"]
+            self.assertEqual([t["status"] for t in tasks], ["failed", "running"])
+            self.assertIn("配置", tasks[0]["detail"])
+            self.assertEqual(worker.call_args.kwargs["args"][0]["id"], "good")
+
+    def test_migrated_task_runs_real_worker_and_reaches_completion(self):
+        commands, threads = [], []
+        build_command, make_thread = W.task_command, threading.Thread
+
+        def command(task):
+            commands.append(build_command(task))
+            return [sys.executable, "-c", "import json,os; "
+                    "json.dump({'phase':'completed','percent':100,'samples':3}, "
+                    "open(os.environ['PROGRESS_PATH'],'w'))"]
+
+        def thread(*args, **kwargs):
+            result = make_thread(*args, **kwargs)
+            threads.append(result)
+            return result
+
+        with self.web_roots(), patch.dict(os.environ, {"RUNTIME_ROOT": str(self.root)}), \
+                patch.object(W, "mac_priority_active", return_value=False), \
+                patch.object(W, "task_command", side_effect=command), patch.object(W.threading, "Thread", side_effect=thread):
+            W.save_tasks({"tasks": [{"id": "old-worker", "kind": "scan", "date": "20240101", "status": "running"}]})
+            W.recover_interrupted_tasks()
+            W.start_next_task()
+            threads[0].join(timeout=5)
+            self.assertFalse(threads[0].is_alive())
+            self.assertEqual(W.load_tasks()["tasks"][0]["status"], "completed")
+            self.assertEqual(W.LIVE_PROGRESS["old-worker"]["samples"], 3)
+            self.assertTrue(all("--run-id" in item and "30" in item for item in commands))
+
+    def test_worker_thread_launch_failure_does_not_leave_fake_running_task(self):
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure), self.web_roots(), \
+                    patch.object(W, "mac_priority_active", return_value=False), \
+                    patch.object(W, "SCHEDULER_WAKE") as wake, patch.object(W.threading, "Thread") as worker:
+                W.save_tasks({"tasks": [
+                    {"id": "first", "kind": "scan", "date": "20240101", "status": "queued"},
+                    {"id": "second", "kind": "scan", "date": "20240102", "status": "queued"},
+                ]})
+                if failure == "construct":
+                    worker.side_effect = RuntimeError("thread unavailable")
+                else:
+                    worker.return_value.start.side_effect = RuntimeError("thread unavailable")
+                W.start_next_task()
+                saved = W.load_tasks()["tasks"]
+                self.assertEqual([t["status"] for t in saved], ["failed", "queued"])
+                self.assertIn("启动失败", saved[0]["detail"])
+                self.assertIn("finished_at", saved[0])
+                wake.set.assert_called()
+                worker.side_effect = None
+                worker.return_value.start.side_effect = None
+                W.start_next_task()
+                self.assertEqual(W.load_tasks()["tasks"][1]["status"], "running")
+
     def test_completed_replacement_scan_unblocks_old_export(self):
         tasks = [
             {"id": "old", "kind": "scan", "date": "20240101", "status": "interrupted"},

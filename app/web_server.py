@@ -94,10 +94,33 @@ def save_tasks(tasks):
     METADATA_DIRTY.set()
 
 
+def migrate_legacy_tasks(tasks):
+    """Fill fields absent in early queues without changing task IDs or completed work."""
+    original = copy.deepcopy(tasks)
+    for task in tasks["tasks"]:
+        if task.get("kind") not in {"scan", "export"}:
+            continue
+        if not task.get("progress_file") and task.get("id"):
+            task["progress_file"] = f"progress-{task['id']}.json"
+        if not task.get("dates") and task.get("date"):
+            task["dates"] = [task["date"]]
+        if task["kind"] == "scan":
+            if not task.get("profile"):
+                task["profile"] = "turbo"
+            task.setdefault("camera", None)
+    if tasks == original:
+        return False
+    backup = TASKS_PATH.with_name(f"tasks.pre-migration-{uuid.uuid4().hex[:12]}.json")
+    write_json(backup, original)
+    os.chmod(backup, 0o600)
+    print(f"[tasks] 旧队列已兼容升级，原记录备份：{backup.name}", flush=True)
+    return True
+
+
 def recover_interrupted_tasks():
     """Resume interrupted work from per-file checkpoints, preserving its dependency IDs."""
     tasks = load_tasks()
-    changed = False
+    changed = migrate_legacy_tasks(tasks)
     for task in tasks["tasks"]:
         if task.get("status") in {"running", "interrupted"}:
             task["status"] = "cancelled" if task.get("cancel_requested") else "paused" if task.get("pause_requested") else "queued"
@@ -512,6 +535,10 @@ def status_snapshot():
 
 
 def task_command(task):
+    if task.get("kind") not in {"scan", "export"} or not task.get("id"):
+        raise ValueError("任务类型或编号缺失")
+    if not DATE_PATTERN.fullmatch(task.get("date", "")):
+        raise ValueError("任务日期无效")
     command = [sys.executable, "-u", str(APP_ROOT / "person_timelapse.py")]
     if task["kind"] == "scan":
         settings = PROFILES[task["profile"]]
@@ -591,7 +618,9 @@ def start_next_task():
                 return
             if any(task["status"] == "running" for task in tasks["tasks"]):
                 return
-            changed, task = repair_dependencies(tasks["tasks"]), None
+            changed = migrate_legacy_tasks(tasks)
+            changed = repair_dependencies(tasks["tasks"]) or changed
+            task = None
             for candidate in tasks["tasks"]:
                 if candidate.get("status") != "queued":
                     continue
@@ -609,6 +638,17 @@ def start_next_task():
                     candidate["finished_at"] = now_iso()
                     changed = True
                     continue
+                try:
+                    task_command(candidate)
+                    progress_file = candidate.get("progress_file")
+                    if not isinstance(progress_file, str) or not progress_file or Path(progress_file).name != progress_file:
+                        raise ValueError("进度文件名无效")
+                except (KeyError, TypeError, ValueError) as error:
+                    candidate["status"] = "failed"
+                    candidate["detail"] = f"任务配置无效：{error}"
+                    candidate["finished_at"] = now_iso()
+                    changed = True
+                    continue
                 task = candidate
                 task["status"] = "running"
                 task["started_at"] = now_iso()
@@ -621,8 +661,19 @@ def start_next_task():
                 break
             if not changed:
                 return
-    thread = threading.Thread(target=task_worker, args=(task, None, task["progress_file"]), daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(target=task_worker, args=(task, None, task["progress_file"]), daemon=True)
+        thread.start()
+    except Exception as error:
+        with LOCK:
+            tasks = load_tasks()
+            saved = next(item for item in tasks["tasks"] if item["id"] == task["id"])
+            saved["status"] = "failed"
+            saved["detail"] = f"任务启动失败：{error}"
+            saved["finished_at"] = now_iso()
+            save_tasks(tasks)
+        print(f"[task {task['id']}] {saved['detail']}", flush=True)
+        SCHEDULER_WAKE.set()
 
 
 def repair_dependencies(tasks):

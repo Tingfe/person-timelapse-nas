@@ -1,8 +1,13 @@
-.git
+# Only application sources and build instructions may enter the build context.
+**
+!Dockerfile
+!.dockerignore
+!app/
+!app/**
+
 .DS_Store
-data/
-output/
-models/
+.env
+.env.*
 *.mp4
 *.mov
 *.avi
@@ -11,6 +16,5 @@ models/
 *.jpeg
 *.png
 *.log
-__pycache__/
-.mac-worker-venv/
-.mac-worker-state/
+**/__pycache__/
+**/*.py[cod]

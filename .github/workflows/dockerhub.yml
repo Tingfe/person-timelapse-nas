@@ -5,10 +5,16 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - .dockerignore
       - app/**
       - tests/**
       - .github/workflows/dockerhub.yml
   workflow_dispatch:
+    inputs:
+      refresh_dependencies:
+        description: Reinstall system dependencies without using the build cache
+        type: boolean
+        default: false
 
 concurrency:
   group: dockerhub-${{ github.ref }}
@@ -33,12 +39,18 @@ jobs:
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - name: Build and publish with reusable dependency layers
+        uses: docker/build-push-action@v6
         if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         with:
           context: .
           platforms: linux/arm64
           push: true
+          # Inline cache survives between runners without a separate cache tag.
+          # Keep the default compression so existing NAS layers remain reusable.
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:latest
+          cache-to: type=inline
+          no-cache: ${{ inputs.refresh_dependencies == true }}
           tags: |
             ${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:latest
             ${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:sha-${{ github.sha }}

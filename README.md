@@ -85,6 +85,12 @@ image: tingfe/person-timelapse-nas:sha-提交哈希
 
 旧镜像不认识新的文件级检查点；如需回退，请使用更新前的整份输出目录备份，避免重复扫描或状态不一致。不要用删除输出目录的方式排障。
 
+### 镜像下载与更新速度
+
+镜像将 AI / FFmpeg 运行环境与程序代码分层保存。基础镜像固定到内容摘要，发布时从 Docker Hub 的上一版镜像恢复构建缓存；只修改程序代码时，NAS 可复用已下载的依赖层，只下载变化的代码层。首次安装、首次启用缓存、清理过本地镜像或升级依赖后，仍可能需要下载较大的依赖层。
+
+拉取时 `Already exists` 表示该层已缓存，`Downloading` 是网络下载，`Extracting` 是本地解压。下载速度仍取决于 NAS 到 Docker Hub 的网络；不要为了加速而删除现有镜像缓存。浏览器或 Mac 上的代理不会自动应用到 NAS 的 Docker 服务，应在 NAS 支持的设置中单独配置可信代理或镜像源。
+
 ## 性能建议
 
 人物识别完全依赖 CPU 时，长时间监控录像的处理会很慢。建议先从“超极速（历史回放）”开始：120 秒抽帧、256px 推理，适合粗筛大量历史录像；只对需要复查的日期使用“极速”“平衡”或“精细”。
@@ -163,5 +169,7 @@ python /opt/person-timelapse/person_timelapse.py export /input /output \
 ## 开发与发布
 
 推送到 `main` 后，GitHub Actions 会先运行可靠性回归测试，通过后才构建 ARM64 镜像并发布 `latest` 与 `sha-提交哈希` 标签。维护者需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`；使用者不需要任何 Docker Hub 凭据。
+
+发布使用镜像内嵌缓存，不需要额外的缓存服务或缓存标签；请勿删除唯一的 `latest` 镜像缓存来源。需要刷新系统依赖时，在 Actions 手动运行发布流程并勾选 `refresh_dependencies`，该次会重新安装依赖，NAS 更新时也可能需要重新下载依赖层。升级 AI 基础环境时需审查并更新 Dockerfile 中的版本和摘要。构建上下文仅包含应用目录和构建说明，不上传录像、输出目录、模型、Mac 虚拟环境或根目录的凭据文件。缓存方案参考 [Docker 官方说明](https://docs.docker.com/build/ci/github-actions/cache/#inline-cache)。
 
 本地测试：`python3 -m unittest discover -s tests -v`。真实编解码集成测试需要现有的 OpenCV 和 FFmpeg 环境，并设置 `RUN_MEDIA_INTEGRATION=1`；测试只使用生成的色块画面，不读取私人录像。

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Remove flagged attestations from tag references without changing runtime layers.
 
-Read-only by default. --apply requires an existing Docker login and rewrites only
+Read-only by default. --apply requires Docker Hub credentials and rewrites only
 tags whose public attestations match the privacy audit. Old digest-addressed
 objects and previously downloaded copies may still require platform support.
 """
 
 import argparse
+import base64
 import hashlib
 import json
-import subprocess
+import os
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from audit_public_images import ACCEPT, REGISTRY, REPOSITORY, fetch, findings
 
@@ -68,12 +72,45 @@ def plan_changes():
                     flagged = True
                     inspect_fields(json.loads(data))
         if flagged:
+            print(f"Flagged tag: {tag}")
+            clean = dict(document)
+            clean["manifests"] = [entry for entry in document["manifests"]
+                                  if entry.get("annotations", {}).get("vnd.docker.reference.type") != "attestation-manifest"]
             changes.append({"tag": tag, "before": "sha256:" + hashlib.sha256(raw).hexdigest(),
-                            "platform": platform_reference(document)})
+                            "platform": platform_reference(document), "clean": clean})
     # Field names only: never print their email values or the event payload.
     for path in sorted(email_fields):
         print(f"Flagged email field: {path}")
     return changes, token
+
+
+def request(request):
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.read()
+    except HTTPError as error:
+        raise RuntimeError(f"Registry cleanup returned HTTP {error.code}") from None
+    except (URLError, OSError):
+        raise RuntimeError("Registry cleanup could not connect; inspect tag state before retrying") from None
+
+
+def push_token():
+    username = os.environ.get("DOCKERHUB_USERNAME", "")
+    secret = os.environ.get("DOCKERHUB_TOKEN", "")
+    if not username or not secret:
+        raise RuntimeError("Apply requires Docker Hub credentials from the protected runner environment")
+    authorization = base64.b64encode(f"{username}:{secret}".encode()).decode()
+    url = ("https://auth.docker.io/token?service=registry.docker.io&"
+           f"scope=repository:{REPOSITORY}:pull,push")
+    return json.loads(request(Request(url, headers={"Authorization": f"Basic {authorization}"})))["token"]
+
+
+def push_index(tag, document, token):
+    data = json.dumps(document, separators=(",", ":")).encode()
+    media_type = document.get("mediaType", "application/vnd.oci.image.index.v1+json")
+    request(Request(f"{REGISTRY}/manifests/{tag}", data=data, method="PUT",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": media_type}))
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def main():
@@ -85,21 +122,21 @@ def main():
     if not args.apply:
         print("Read-only preview; no tag changes made")
         return
+    writable_token = push_token() if changes else None
     for item in changes:
-        tag = f"{REPOSITORY}:{item['tag']}"
         # Ensure the tag has not moved since the read-only planning phase.
         current = fetch(f"{REGISTRY}/manifests/{item['tag']}", token, ACCEPT)
         if "sha256:" + hashlib.sha256(current).hexdigest() != item["before"]:
             raise RuntimeError("Tag changed during cleanup; retry after publication finishes")
-        try:
-            result = subprocess.run(["docker", "buildx", "imagetools", "create", "--tag", tag,
-                                     f"{REPOSITORY}@{item['platform']}"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
-        except (OSError, subprocess.TimeoutExpired):
-            raise RuntimeError("Docker cleanup could not finish; inspect tag state before retrying") from None
-        if result.returncode:
-            raise RuntimeError("Docker could not update tag metadata; successful previous tags are retained")
-        after = json.loads(fetch(f"{REGISTRY}/manifests/{item['tag']}", token, ACCEPT))
+        expected = push_index(item["tag"], item["clean"], writable_token)
+        for attempt in range(5):
+            after_raw = fetch(f"{REGISTRY}/manifests/{item['tag']}", token, ACCEPT)
+            if "sha256:" + hashlib.sha256(after_raw).hexdigest() == expected:
+                break
+            if attempt == 4:
+                raise RuntimeError("Tag read-back did not match the clean index; inspect before retrying")
+            time.sleep(1)
+        after = json.loads(after_raw)
         if platform_reference(after) != item["platform"] or any(
                 entry.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
                 for entry in after.get("manifests", [])):

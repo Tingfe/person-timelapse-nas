@@ -22,7 +22,7 @@ ACCEPT = ", ".join(("application/vnd.oci.image.index.v1+json",
 
 
 def fetch(url, token=None, accept=None):
-    headers = {"User-Agent": "person-timelapse-public-privacy-audit"}
+    headers = {"User-Agent": "person-timelapse-public-privacy-audit", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if accept:
@@ -40,7 +40,7 @@ def findings(data):
     text = data.decode("utf-8", "replace")
     result = set()
     emails = re.findall(r"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}", text)
-    if any(not value.endswith("@users.noreply.github.com") for value in emails):
+    if any(not value.endswith("@users.noreply.github.com") and value != "git@github.com" for value in emails):
         result.add("email address requiring review")
     if re.search(r"/Users/[^/\s\"']+|/Volumes/(?!camera-recordings)[^/\s\"']+", text):
         result.add("personal host path")

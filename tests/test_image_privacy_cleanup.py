@@ -53,42 +53,75 @@ class ImagePrivacyCleanupTests(unittest.TestCase):
         self.assertIn("/predicate/github_event_payload/pusher/email", output.getvalue())
         self.assertNotIn("private@example.org", output.getvalue())
 
-    def test_preview_never_invokes_docker(self):
+    def test_public_git_ssh_url_is_not_a_private_email(self):
+        self.assertFalse(AUDIT.findings(b'git@github.com:example/public-project.git'))
+        self.assertIn("email address requiring review", AUDIT.findings(b'private@example.org'))
+
+    def test_preview_never_authenticates_or_writes(self):
         with patch.object(sys, "argv", ["cleanup"]), patch.object(CLEANUP, "plan_changes", return_value=([], "token")), \
-                patch.object(CLEANUP.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+                patch.object(CLEANUP, "push_token") as auth, patch.object(CLEANUP, "push_index") as write, \
+                contextlib.redirect_stdout(io.StringIO()):
             CLEANUP.main()
-        run.assert_not_called()
+        auth.assert_not_called()
+        write.assert_not_called()
 
     def test_moved_tag_is_not_overwritten(self):
         changes = [{"tag": "example", "before": "sha256:" + "0" * 64, "platform": RUNTIME}]
         with patch.object(sys, "argv", ["cleanup", "--apply"]), \
                 patch.object(CLEANUP, "plan_changes", return_value=(changes, "token")), \
                 patch.object(CLEANUP, "fetch", return_value=b"changed"), \
-                patch.object(CLEANUP.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+                patch.object(CLEANUP, "push_token", return_value="write-token"), \
+                patch.object(CLEANUP, "push_index") as write, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "Tag changed"):
                 CLEANUP.main()
-        run.assert_not_called()
+        write.assert_not_called()
 
     def test_apply_verifies_the_preserved_runtime(self):
         before = json.dumps(INDEX).encode()
-        changes = [{"tag": "example", "before": "sha256:" + hashlib.sha256(before).hexdigest(), "platform": RUNTIME}]
-        after = json.dumps({"manifests": [INDEX["manifests"][0]]}).encode()
+        clean = {"manifests": [INDEX["manifests"][0]]}
+        changes = [{"tag": "example", "before": "sha256:" + hashlib.sha256(before).hexdigest(),
+                    "platform": RUNTIME, "clean": clean}]
+        after = json.dumps(clean).encode()
         with patch.object(sys, "argv", ["cleanup", "--apply"]), \
                 patch.object(CLEANUP, "plan_changes", return_value=(changes, "token")), \
                 patch.object(CLEANUP, "fetch", side_effect=[before, after]), \
-                patch.object(CLEANUP.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()):
-            run.return_value.returncode = 0
+                patch.object(CLEANUP, "push_token", return_value="write-token"), \
+                patch.object(CLEANUP, "push_index", return_value="sha256:" + hashlib.sha256(after).hexdigest()) as write, \
+                contextlib.redirect_stdout(io.StringIO()):
             CLEANUP.main()
-        self.assertEqual(run.call_args.args[0][-1], f"{CLEANUP.REPOSITORY}@{RUNTIME}")
+        self.assertEqual(write.call_args.args, ("example", clean, "write-token"))
 
     def test_apply_rejects_readback_with_changed_runtime(self):
         before = json.dumps(INDEX).encode()
-        changes = [{"tag": "example", "before": "sha256:" + hashlib.sha256(before).hexdigest(), "platform": RUNTIME}]
+        changes = [{"tag": "example", "before": "sha256:" + hashlib.sha256(before).hexdigest(),
+                    "platform": RUNTIME, "clean": {"manifests": [INDEX["manifests"][0]]}}]
         after = json.dumps({"manifests": [{**INDEX["manifests"][0], "digest": "sha256:" + "4" * 64}]}).encode()
         with patch.object(sys, "argv", ["cleanup", "--apply"]), \
                 patch.object(CLEANUP, "plan_changes", return_value=(changes, "token")), \
                 patch.object(CLEANUP, "fetch", side_effect=[before, after]), \
-                patch.object(CLEANUP.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()):
-            run.return_value.returncode = 0
+                patch.object(CLEANUP, "push_token", return_value="write-token"), \
+                patch.object(CLEANUP, "push_index", return_value="sha256:" + hashlib.sha256(after).hexdigest()), \
+                contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "read-back failed"):
                 CLEANUP.main()
+
+    def test_apply_waits_for_exact_index_readback(self):
+        before = json.dumps(INDEX).encode()
+        clean = {"manifests": [INDEX["manifests"][0]]}
+        after = json.dumps(clean).encode()
+        changes = [{"tag": "example", "before": "sha256:" + hashlib.sha256(before).hexdigest(),
+                    "platform": RUNTIME, "clean": clean}]
+        with patch.object(sys, "argv", ["cleanup", "--apply"]), \
+                patch.object(CLEANUP, "plan_changes", return_value=(changes, "token")), \
+                patch.object(CLEANUP, "fetch", side_effect=[before, before, after]), \
+                patch.object(CLEANUP, "push_token", return_value="write-token"), \
+                patch.object(CLEANUP, "push_index", return_value="sha256:" + hashlib.sha256(after).hexdigest()), \
+                patch.object(CLEANUP.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            CLEANUP.main()
+        sleep.assert_called_once_with(1)
+
+    def test_apply_requires_protected_credentials(self):
+        with patch.dict(CLEANUP.os.environ, {}, clear=True), patch.object(CLEANUP, "request") as request:
+            with self.assertRaisesRegex(RuntimeError, "protected runner"):
+                CLEANUP.push_token()
+        request.assert_not_called()

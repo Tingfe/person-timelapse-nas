@@ -29,6 +29,7 @@ jobs:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKER_BUILD_RECORD_UPLOAD: "false"
+      DOCKER_BUILD_SUMMARY: "false"
     steps:
       - name: Mask personal email metadata before third-party actions
         run: |
@@ -56,8 +57,8 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
-          # Public repositories otherwise default to max provenance, which includes event metadata.
-          provenance: mode=min
+          # Even min provenance can carry GitHub event metadata in this toolchain.
+          provenance: false
           # Inline cache survives between runners without a separate cache tag.
           # Keep the default compression so existing NAS layers remain reusable.
           cache-from: type=registry,ref=${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:latest
@@ -66,3 +67,6 @@ jobs:
           tags: |
             ${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:latest
             ${{ env.DOCKERHUB_USERNAME }}/person-timelapse-nas:sha-${{ github.sha }}
+      - name: Verify public image privacy after publication
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        run: python3 scripts/audit_public_images.py

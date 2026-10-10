@@ -2,17 +2,24 @@
 """Read-only person-event indexing and timelapse export for Xiaomi MP4 files."""
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+from storage import atomic_json, shared_lock
 
 VIDEO_PATTERN = re.compile(
     r"^video_\d+_(?P<camera>\d+)_\d+_(?P<start>\d{14})_(?P<end>\d{14})\.mp4$", re.IGNORECASE
@@ -48,7 +55,28 @@ def parse_record(path: Path):
     return values
 
 
-def find_records(root: Path, day: Optional[str] = None, days=None):
+def find_records(root: Path, day: Optional[str] = None, days=None, database=None):
+    # An existing index is authoritative for a queued task. Do not walk the
+    # entire archive again for every individual recording date.
+    if database and Path(database).exists():
+        selected_days = sorted(set(days or ([day] if day else [])))
+        query = "SELECT path,size,camera,start,ending FROM videos"
+        arguments = []
+        if selected_days:
+            query += " WHERE " + " OR ".join("(start >= ? AND start < ?)" for _ in selected_days)
+            for selected in selected_days:
+                following = (datetime.strptime(selected, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+                arguments.extend((selected, following))
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            rows = connection.execute(query, arguments).fetchall()
+        indexed = []
+        for relative, size, camera, start, end in rows:
+            if (day and start[:8] != day) or (days and start[:8] not in days):
+                continue
+            indexed.append({"path": root / relative, "size": size, "camera": camera,
+                            "start": datetime.strptime(start, TIME_FORMAT),
+                            "end": datetime.strptime(end, TIME_FORMAT)})
+        return sorted(indexed, key=lambda item: (item["camera"], item["start"], item["path"].name))
     records = []
     for path in root.rglob("*.mp4"):
         record = parse_record(path)
@@ -68,17 +96,117 @@ def source_id(record):
     ))
 
 
-def load_ledger(output_root: Path):
+def result_path(output_root, identity):
+    day = identity.split(":")[1][:8]
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return output_root / "scan-results" / day / f"{digest}.json"
+
+
+def scan_results(output_root, day=None):
+    directory = output_root / "scan-results"
+    directory = directory / day if day else directory
+    for path in directory.glob("*.json" if day else "*/*.json"):
+        yield json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_ledger(output_root: Path, day=None, include_results=True):
     path = output_root / "processed.json"
-    if not path.exists():
-        return {"sources": {}}
-    return json.loads(path.read_text(encoding="utf-8"))
+    ledger = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"sources": {}}
+    for result in (scan_results(output_root, day) if include_results else []):
+        identity = result["source_id"]
+        if result["status"] == "completed":
+            ledger["sources"][identity] = result
+        else:
+            ledger["sources"].pop(identity, None)
+    return ledger
 
 
 def save_ledger(output_root: Path, ledger):
-    (output_root / "processed.json").write_text(
-        json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # Compatibility for older callers. New scans commit one independent file
+    # at a time and never replace the shared legacy ledger.
+    with shared_lock(output_root / ".ledger.lock"):
+        target = output_root / "processed.json"
+        current = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {"sources": {}}
+        current["sources"].update(ledger["sources"])
+        atomic_json(target, current)
+
+
+def scan_settings(sample_seconds, confidence, merge_seconds, motion_threshold, keepalive_seconds, imgsz):
+    return {"sample_seconds": sample_seconds, "confidence": confidence, "merge_seconds": merge_seconds,
+            "motion_threshold": motion_threshold, "keepalive_seconds": keepalive_seconds, "imgsz": imgsz}
+
+
+def settings_satisfied(entry, requested):
+    previous = entry.get("settings")
+    if not previous:
+        return True  # Existing archives remain usable; explicit rescan upgrades them.
+    old_motion, new_motion = previous.get("motion_threshold"), requested.get("motion_threshold")
+    return (previous["sample_seconds"] <= requested["sample_seconds"]
+            and previous["imgsz"] >= requested["imgsz"]
+            and previous["confidence"] == requested["confidence"]
+            and (old_motion is None or (new_motion is not None and old_motion <= new_motion)))
+
+
+def rebuild_events(output_root, day, merge_seconds=20):
+    """Rebuild a date snapshot without overwriting another node's file results."""
+    with shared_lock(output_root / "locks" / f"events-{day}", timeout=30):
+        target = output_root / f"events-{day}.json"
+        backup = output_root / "legacy-events" / f"events-{day}.json"
+        if not backup.exists():
+            previous = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+            atomic_json(backup, previous.get("events", {}) if previous.get("schema_version") != 2 else {})
+        groups = json.loads(backup.read_text(encoding="utf-8"))
+        results = list(scan_results(output_root, day))
+        for result in results:
+            camera = result["camera"]
+            retained = []
+            for event in groups.get(camera, []):
+                if not overlaps(datetime.fromisoformat(result["start"]), datetime.fromisoformat(result["end"]),
+                                datetime.fromisoformat(event["start"]), datetime.fromisoformat(event["end"])):
+                    retained.append(event)
+                else:
+                    if event["start"] < result["start"]:
+                        retained.append({**event, "end": result["start"]})
+                    if event["end"] > result["end"]:
+                        retained.append({**event, "start": result["end"]})
+            groups[camera] = retained
+        for result in results:
+            for camera, events in result.get("events", {}).items():
+                groups.setdefault(camera, []).extend(events)
+        groups = {camera: events for camera, events in groups.items() if events}
+        payload = {"date": day, "schema_version": 2, "events": merge_events(groups, merge_seconds),
+                   "failed_files": sum(r["status"] == "failed" for r in results),
+                   "processed_sources": [r["source_id"] for r in results if r["status"] == "completed"],
+                   "failed_sources": [r["source_id"] for r in results if r["status"] == "failed"],
+                   "settings": list({json.dumps(r["settings"], sort_keys=True): r["settings"]
+                                     for r in results if r["status"] == "completed"}.values())}
+        atomic_json(target, payload)
+        return payload
+
+
+def commit_result(output_root, record, settings, events=None, error=None, run_id=None):
+    identity = source_id(record)
+    target = result_path(output_root, identity)
+    if error and target.exists():
+        events = json.loads(target.read_text(encoding="utf-8")).get("events", {})
+    elif error:
+        # A failed upgrade must not erase useful results made by older versions.
+        previous = output_root / f"events-{record['start']:%Y%m%d}.json"
+        groups = json.loads(previous.read_text(encoding="utf-8")).get("events", {}) if previous.exists() else {}
+        preserved = []
+        for event in groups.get(record["camera"], []):
+            start, end = datetime.fromisoformat(event["start"]), datetime.fromisoformat(event["end"])
+            if overlaps(record["start"], record["end"], start, end):
+                preserved.append({**event, "start": max(start, record["start"]).isoformat(timespec="seconds"),
+                                  "end": min(end, record["end"]).isoformat(timespec="seconds")})
+        events = {record["camera"]: preserved} if preserved else {}
+    result = {"source_id": identity, "path": str(record["path"]), "camera": record["camera"],
+              "start": record["start"].isoformat(timespec="seconds"), "end": record["end"].isoformat(timespec="seconds"),
+              "status": "failed" if error else "completed", "settings": settings,
+              "run_id": run_id,
+              "processed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "events": events or {}, "error": error}
+    atomic_json(target, result)
+    rebuild_events(output_root, record["start"].strftime("%Y%m%d"), settings.get("merge_seconds", 20))
 
 
 def report_progress(**values):
@@ -88,9 +216,8 @@ def report_progress(**values):
         return
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(target)
+    values["heartbeat_at"] = time.time()
+    atomic_json(target, values, durable=False)
 
 
 def merge_events(event_groups, merge_seconds):
@@ -103,7 +230,7 @@ def merge_events(event_groups, merge_seconds):
                 merged[camera][-1]["end"] = max(merged[camera][-1]["end"], event["end"])
                 merged[camera][-1]["hits"] += event["hits"]
             else:
-                merged[camera].append(event)
+                merged[camera].append(dict(event))
     return dict(merged)
 
 
@@ -138,19 +265,19 @@ def save_thumbnail(frame, output_root: Path, camera: str, moment: datetime):
 
 def scan(records, output_root: Path, sample_seconds: float, confidence: float, merge_seconds: float,
          motion_threshold: Optional[float] = None, keepalive_seconds: float = 60.0, imgsz: int = 640,
-         device: Optional[str] = None):
+         device: Optional[str] = None, checkpoint=None, force=False, run_id=None):
     import cv2
     from ultralytics import YOLO
 
     model = YOLO(os.environ.get("MODEL_PATH", "/models/yolo11n.pt"))
     events = defaultdict(list)
-    last_person = {}
     samples = 0
     inferences = 0
     estimated_samples = max(1, sum(
-        int((record["end"] - record["start"]).total_seconds() / sample_seconds) for record in records
+        math.ceil((record["end"] - record["start"]).total_seconds() / sample_seconds) for record in records
     ))
     started = time.monotonic()
+    settings = scan_settings(sample_seconds, confidence, merge_seconds, motion_threshold, keepalive_seconds, imgsz)
 
     def update(index, record, offset):
         elapsed = max(time.monotonic() - started, 0.001)
@@ -161,83 +288,121 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
             file_index=index, total_files=len(records), offset_seconds=round(offset, 1),
             samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
             elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta, 1) if eta is not None else None,
+            source={"source_id": source_id(record), "path": str(record["path"]), "camera": record["camera"],
+                    "start": record["start"].isoformat(), "end": record["end"].isoformat(), "settings": settings},
         )
 
     for index, record in enumerate(records, start=1):
         print(f"[{index}/{len(records)}] {record['path'].name}", flush=True)
         update(index, record, 0)
-        capture = cv2.VideoCapture(str(record["path"]))
-        if not capture.isOpened():
-            print(f"skip unreadable: {record['path']}", file=sys.stderr)
-            continue
-        fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-        duration = min(frame_count / fps, (record["end"] - record["start"]).total_seconds())
-        offset = 0.0
-        previous_gray = None
-        while offset < duration:
-            capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
-            ok, frame = capture.read()
-            if not ok:
-                offset += sample_seconds
-                continue
-            samples += 1
-            moment = record["start"] + timedelta(seconds=offset)
-            current_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
-            motion = (
-                previous_gray is None
-                or motion_threshold is None
-                or cv2.mean(cv2.absdiff(current_gray, previous_gray))[0] >= motion_threshold
-            )
-            previous_gray = current_gray
-            recently_seen = (moment - last_person.get(record["camera"], datetime.min)).total_seconds() <= keepalive_seconds
-            if motion_threshold is not None and not motion and not recently_seen:
-                if samples % 5 == 0:
-                    update(index, record, offset)
-                offset += sample_seconds
-                continue
-            inferences += 1
-            result = model(frame, classes=[0], conf=confidence, imgsz=imgsz, verbose=False, device=device)[0]
-            if len(result.boxes):
-                last_person[record["camera"]] = moment
-                thumbnail = save_thumbnail(frame, output_root, record["camera"], moment)
-                camera_events = events[record["camera"]]
-                if camera_events and (moment - datetime.fromisoformat(camera_events[-1]["end"])).total_seconds() <= merge_seconds:
-                    camera_events[-1]["end"] = moment.isoformat(timespec="seconds")
-                    camera_events[-1]["hits"] += 1
-                else:
-                    camera_events.append({
-                        "start": moment.isoformat(timespec="seconds"),
-                        "end": moment.isoformat(timespec="seconds"),
-                        "hits": 1,
-                        "thumbnail": str(thumbnail.relative_to(output_root)),
-                    })
-            if samples % 5 == 0:
+        try:
+            lease = shared_lock(output_root / "locks" / result_path(output_root, source_id(record)).stem, timeout=1)
+            with lease:
+                saved = result_path(output_root, source_id(record))
+                if checkpoint and saved.exists():
+                    entry = json.loads(saved.read_text(encoding="utf-8"))
+                    if (entry["status"] == "completed" and settings_satisfied(entry, settings)
+                            and (not force or (run_id and entry.get("run_id") == run_id))):
+                        continue
+                capture, file_events, error, offset = None, defaultdict(list), None, 0.0
+                try:
+                    capture = cv2.VideoCapture(str(record["path"]))
+                    if not capture.isOpened():
+                        raise RuntimeError("视频无法打开")
+                    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+                    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                    duration = min(frame_count / fps, (record["end"] - record["start"]).total_seconds())
+                    if not math.isfinite(duration) or duration <= 0:
+                        raise RuntimeError("视频没有有效时长")
+                    offset, decoded, failed_reads = 0.0, 0, 0
+                    previous_gray, last_person = None, datetime.min
+                    while offset < duration:
+                        update(index, record, offset)
+                        capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
+                        ok, frame = capture.read()
+                        if not ok:
+                            failed_reads += 1
+                            offset += sample_seconds
+                            continue
+                        decoded += 1
+                        samples += 1
+                        moment = record["start"] + timedelta(seconds=offset)
+                        current_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
+                        motion = (previous_gray is None or motion_threshold is None
+                                  or cv2.mean(cv2.absdiff(current_gray, previous_gray))[0] >= motion_threshold)
+                        previous_gray = current_gray
+                        recently_seen = (moment - last_person).total_seconds() <= keepalive_seconds
+                        if motion_threshold is not None and not motion and not recently_seen:
+                            offset += sample_seconds
+                            continue
+                        inferences += 1
+                        result = model(frame, classes=[0], conf=confidence, imgsz=imgsz, verbose=False, device=device)[0]
+                        if len(result.boxes):
+                            last_person = moment
+                            thumbnail = save_thumbnail(frame, output_root, record["camera"], moment)
+                            # Keep a short context around a hit instead of producing a zero-duration event.
+                            padding = timedelta(seconds=min(5, sample_seconds / 2))
+                            file_events[record["camera"]].append({
+                                "start": max(record["start"], moment - padding).isoformat(timespec="seconds"),
+                                "end": min(record["start"] + timedelta(seconds=duration), moment + padding).isoformat(timespec="seconds"),
+                                "hits": 1, "thumbnail": str(thumbnail.relative_to(output_root)),
+                            })
+                        offset += sample_seconds
+                    if not decoded or failed_reads:
+                        raise RuntimeError(f"解码不完整：成功 {decoded} 次，失败 {failed_reads} 次")
+                except Exception as exception:
+                    error = str(exception)
+                    print(f"scan failed: {record['path'].name}: {error}", file=sys.stderr, flush=True)
+                finally:
+                    if capture is not None:
+                        capture.release()
+                if checkpoint:
+                    checkpoint(record, settings, merge_events(file_events, merge_seconds), error)
+                if not error:
+                    for camera, found in file_events.items():
+                        events[camera].extend(found)
                 update(index, record, offset)
-            offset += sample_seconds
-        capture.release()
+        except TimeoutError:
+            print(f"另一个节点正在扫描，稍后重试：{record['path'].name}", flush=True)
     print(f"samples={samples} yolo_inferences={inferences}", flush=True)
     report_progress(
         phase="completed", percent=100, file_index=len(records), total_files=len(records),
         samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
         elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
     )
-    return dict(events)
+    return merge_events(events, merge_seconds)
 
 
 def read_events(events_path: Path, camera: str):
     data = json.loads(events_path.read_text(encoding="utf-8"))
-    return [
-        (datetime.fromisoformat(event["start"]), datetime.fromisoformat(event["end"]))
-        for event in data["events"].get(camera, [])
-    ]
+    events = []
+    for event in data["events"].get(camera, []):
+        start, end = datetime.fromisoformat(event["start"]), datetime.fromisoformat(event["end"])
+        # Older sparse scans stored point events. Give those existing archives
+        # context too, without requiring another expensive person scan.
+        if start == end:
+            start, end = start - timedelta(seconds=5), end + timedelta(seconds=5)
+        events.append((start, end))
+    return events
 
 
 def overlaps(start, end, event_start, event_end):
     return start <= event_end and end >= event_start
 
 
-def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int):
+def valid_video(path):
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+                                 "-of", "json", str(path)], capture_output=True, text=True, timeout=30, check=True)
+        metadata = json.loads(result.stdout)
+        return float(metadata.get("format", {}).get("duration", 0)) > 0 and any(
+            stream.get("codec_type") == "video" and stream.get("width", 0) > 0 for stream in metadata.get("streams", []))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int,
+           scan_failed_files=0):
     import cv2
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -245,52 +410,89 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     if not selected_events:
         raise SystemExit(f"camera {camera} has no events to export")
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="person-timelapse-") as temporary:
-        frames_dir = Path(temporary)
-        count = 0
-        written_moments = set()
-        for record_index, record in enumerate(candidates, start=1):
-            relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
-            if not relevant:
-                continue
-            report_progress(
-                phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
-                current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
-                frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None,
-            )
-            capture = cv2.VideoCapture(str(record["path"]))
-            if not capture.isOpened():
-                continue
-            for event_start, event_end in relevant:
-                start = max(record["start"], event_start)
-                end = min(record["end"], event_end)
-                offset = (start - record["start"]).total_seconds()
-                stop = (end - record["start"]).total_seconds()
-                while offset <= stop:
-                    moment = record["start"] + timedelta(seconds=offset)
-                    moment_key = moment.isoformat(timespec="seconds")
-                    if moment_key not in written_moments:
-                        capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
-                        ok, frame = capture.read()
-                        if ok:
-                            written_moments.add(moment_key)
-                            count += 1
-                            cv2.imwrite(str(frames_dir / f"frame-{count:08d}.jpg"), frame)
-                    offset += frame_seconds
-            capture.release()
-        if not count:
-            raise SystemExit("no frames could be read for the selected events")
-        target = output_root / f"people-timelapse-{camera}-{day}.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-framerate", str(fps),
-            "-i", str(frames_dir / "frame-%08d.jpg"), "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "26",
-            "-pix_fmt", "yuv420p", str(target),
-        ], check=True)
+    target = output_root / f"people-timelapse-{camera}-{day}.mp4"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".partial.mp4", dir=output_root)
+    os.close(descriptor)
+    process = None
+    failed_files = set()
+    try:
+        with tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "image2pipe", "-vcodec", "mjpeg",
+                "-framerate", str(fps), "-i", "pipe:0", "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "26",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary,
+            ], stdin=subprocess.PIPE, stderr=errors)
+            count = 0
+            written_moments = set()
+            for record_index, record in enumerate(candidates, start=1):
+                relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
+                if not relevant:
+                    continue
+                report_progress(
+                    phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
+                    current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
+                    frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None,
+                )
+                capture = cv2.VideoCapture(str(record["path"]))
+                try:
+                    if not capture.isOpened():
+                        failed_files.add(record["path"].name)
+                        continue
+                    for event_start, event_end in relevant:
+                        start = max(record["start"], event_start)
+                        end = min(record["end"], event_end)
+                        offset = (start - record["start"]).total_seconds()
+                        stop = (end - record["start"]).total_seconds()
+                        while offset < stop:
+                            report_progress(phase="exporting", percent=round(record_index / max(len(candidates), 1) * 90, 1),
+                                            current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
+                                            frames=count, elapsed_seconds=round(time.monotonic() - started, 1))
+                            moment_key = (record["start"] + timedelta(seconds=offset)).isoformat()
+                            if moment_key not in written_moments:
+                                capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
+                                ok, frame = capture.read()
+                                if ok:
+                                    written_moments.add(moment_key)
+                                    ok, encoded = cv2.imencode(".jpg", frame)
+                                    if not ok:
+                                        raise RuntimeError("无法编码延时帧")
+                                    process.stdin.write(encoded.tobytes())
+                                    count += 1
+                                else:
+                                    failed_files.add(record["path"].name)
+                            offset += frame_seconds
+                finally:
+                    capture.release()
+            if not count:
+                raise RuntimeError("所选事件未能读取任何画面，原有成片已保留")
+            process.stdin.close()
+            report_progress(phase="encoding", percent=95, frames=count, elapsed_seconds=round(time.monotonic() - started, 1))
+            if process.wait(timeout=float(os.environ.get("ENCODE_TIMEOUT_SECONDS", "300"))) != 0:
+                errors.seek(0)
+                raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-2000:])
+            if not valid_video(temporary):
+                raise RuntimeError("成片校验失败，原有视频已保留")
+            os.replace(temporary, target)
+            stat = target.stat()
+            atomic_json(target.with_suffix(".json"), {"status": "partial" if failed_files or scan_failed_files else "completed",
+                        "failed_files": sorted(failed_files), "scan_failed_files": scan_failed_files, "frames": count, "fps": fps,
+                        "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "validated": True})
+    finally:
+        if process and process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        Path(temporary).unlink(missing_ok=True)
     report_progress(
-        phase="completed", percent=100, file_index=len(candidates), total_files=len(candidates),
+        phase="partial" if failed_files or scan_failed_files else "completed", percent=100, file_index=len(candidates), total_files=len(candidates),
+        failed_files=len(failed_files),
         frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
     )
+    if failed_files:
+        print(f"已生成可用成片，但 {len(failed_files)} 个源文件有读取失败，请检查后重试。", file=sys.stderr)
+    if scan_failed_files:
+        print(f"前置人物扫描中有 {scan_failed_files} 个失败文件，成片并非完整扫描结果。", file=sys.stderr)
     print(target)
+    return 2 if failed_files or scan_failed_files else 0
 
 
 def main():
@@ -308,6 +510,8 @@ def main():
     scan_parser.add_argument("--merge-seconds", type=float, default=20.0)
     scan_parser.add_argument("--limit", type=int, help="only scan the first N files, for a trial")
     scan_parser.add_argument("--force", action="store_true", help="rescan files already present in the ledger")
+    scan_parser.add_argument("--run-id", help="stable queue task identity for resumable forced rescans")
+    scan_parser.add_argument("--retry-failed", action="store_true", help="retry files previously recorded as failed")
     scan_parser.add_argument("--motion-threshold", type=float,
                              help="skip low-motion samples; values near 2-5 suit 8-bit grayscale frames")
     scan_parser.add_argument("--keepalive-seconds", type=float, default=60.0,
@@ -325,47 +529,59 @@ def main():
     summary_parser = subparsers.add_parser("summary")
     summary_parser.add_argument("input", type=Path)
     args = parser.parse_args()
+    if getattr(args, "sample_seconds", 1) <= 0 or getattr(args, "frame_seconds", 1) <= 0 or getattr(args, "fps", 1) <= 0:
+        parser.error("采样间隔、抽帧间隔和帧率必须大于零")
+    database = os.environ.get("INVENTORY_DB_PATH")
     if args.command == "scan":
-        records = find_records(args.input, args.date)
+        if args.force and not args.run_id:
+            args.run_id = uuid.uuid4().hex
+        records = find_records(args.input, args.date, database=database)
         if not records:
             raise SystemExit(f"no matching MP4 files for {args.date} under {args.input}")
         args.output.mkdir(parents=True, exist_ok=True)
-        ledger = load_ledger(args.output)
-        pending = records if args.force else [record for record in records if source_id(record) not in ledger["sources"]]
+        ledger = load_ledger(args.output, args.date)
+        settings = scan_settings(args.sample_seconds, args.confidence, args.merge_seconds,
+                                 args.motion_threshold, args.keepalive_seconds, args.imgsz)
+        failures = {r["source_id"] for r in scan_results(args.output, args.date) if r["status"] == "failed"}
+        def needs_scan(record):
+            identity = source_id(record)
+            previous = ledger["sources"].get(identity)
+            force_needed = args.force and (not args.run_id or not previous or previous.get("run_id") != args.run_id)
+            return force_needed or not previous or not settings_satisfied(previous, settings)
+
+        pending = [record for record in records if needs_scan(record)
+                   and (args.retry_failed or source_id(record) not in failures)]
         if args.limit:
             pending = pending[:args.limit]
         if not pending:
+            rebuild_events(args.output, args.date, args.merge_seconds)
             print("no new files to scan")
-            return
-        target = args.output / f"events-{args.date}.json"
-        old_events = json.loads(target.read_text(encoding="utf-8"))["events"] if target.exists() else {}
-        new_events = scan(
+            return 2 if failures else 0
+        scan(
             pending, args.output, args.sample_seconds, args.confidence, args.merge_seconds,
             args.motion_threshold, args.keepalive_seconds, args.imgsz, args.device,
+            checkpoint=lambda record, settings, events, error: commit_result(args.output, record, settings, events, error, args.run_id),
+            force=args.force, run_id=args.run_id,
         )
-        payload = {
-            "date": args.date,
-            "sample_seconds": args.sample_seconds,
-            "events": merge_events({
-                camera: old_events.get(camera, []) + new_events.get(camera, [])
-                for camera in set(old_events) | set(new_events)
-            }, args.merge_seconds),
-        }
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        for record in pending:
-            ledger["sources"][source_id(record)] = {
-                "path": str(record["path"]),
-                "processed_at": datetime.now().isoformat(timespec="seconds"),
-            }
-        save_ledger(args.output, ledger)
-        print(target)
+        ledger = load_ledger(args.output, args.date)
+        incomplete = {source_id(record) for record in records if needs_scan(record)}
+        failures = {r["source_id"] for r in scan_results(args.output, args.date) if r["status"] == "failed"}
+        deferred = bool(incomplete - failures) and not args.limit
+        report_progress(phase="waiting" if deferred else "partial" if incomplete else "completed",
+                        percent=0 if deferred else 100, failed_files=len(incomplete & failures), pending_files=len(incomplete))
+        print(args.output / f"events-{args.date}.json")
+        if deferred:
+            print("部分源文件正在由其他节点处理，稍后自动续排。", flush=True)
+            return 3
+        return 2 if incomplete else 0
     elif args.command == "export":
         payloads = [json.loads(path.read_text(encoding="utf-8")) for path in args.events]
         days = [payload["date"] for payload in payloads]
-        records = find_records(args.input, days=set(days))
+        records = find_records(args.input, days=set(days), database=database)
         events = [event for path in args.events for event in read_events(path, args.camera)]
         label = days[0] if len(days) == 1 else f"{min(days)}-{max(days)}"
-        export(records, events, args.output, args.camera, label, args.frame_seconds, args.fps)
+        return export(records, events, args.output, args.camera, label, args.frame_seconds, args.fps,
+                      sum(payload.get("failed_files", 0) for payload in payloads))
     elif args.command == "inventory":
         records = find_records(args.input, args.date)
         print(json.dumps([{
@@ -379,4 +595,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Let context managers release shared leases on a normal container/worker stop.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    sys.exit(main() or 0)

@@ -2,24 +2,29 @@
 """Local-only web console for the person timelapse workflow."""
 
 import json
+import copy
 import hmac
 import os
 import re
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from person_timelapse import load_ledger, parse_record, source_id
+from person_timelapse import (commit_result, load_ledger, parse_record, source_id,
+                             scan_settings, settings_satisfied, valid_video)
+from storage import atomic_json, shared_lock
 
 
 INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
@@ -35,10 +40,18 @@ TIMELAPSE_PATTERN = re.compile(r"^people-timelapse-(\d+|legacy)-(\d{8})(?:-(\d{8
 LOCK = threading.Lock()
 INVENTORY_LOCK = threading.Lock()
 INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": False}
-INVENTORY_TTL_SECONDS = 30
+INVENTORY_TTL_SECONDS = float(os.environ.get("INDEX_REFRESH_SECONDS", "3600"))
 PROCESSES = {}
 SESSIONS = set()
 ACCESS_PASSWORD = ""
+TASK_CACHE = None
+TASK_CACHE_PATH = None
+STATE_READY = False
+LIVE_PROGRESS = {}
+OVERVIEW = {"dates": [], "timelapses": [], "diagnostics": {}, "indexing": False}
+METADATA_DIRTY = threading.Event()
+SCHEDULER_WAKE = threading.Event()
+STALLED_SECONDS = float(os.environ.get("TASK_STALL_SECONDS", "300"))
 PROFILES = {
     "archive": {"label": "超极速（历史回放）", "sample_seconds": "120", "motion_threshold": "8", "imgsz": "256"},
     "turbo": {"label": "极速（Z2 推荐）", "sample_seconds": "30", "motion_threshold": "5", "imgsz": "320"},
@@ -47,35 +60,49 @@ PROFILES = {
 }
 
 
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def read_json(path, fallback):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return fallback
 
 
 def write_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_json(path, value)
 
 
 def load_tasks():
-    return read_json(TASKS_PATH, {"tasks": []})
+    if STATE_READY and TASK_CACHE_PATH == TASKS_PATH and TASK_CACHE is not None:
+        return copy.deepcopy(TASK_CACHE)
+    if not TASKS_PATH.exists():
+        return {"tasks": []}
+    # Never turn an unreadable queue into an empty one and overwrite it later.
+    tasks = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(tasks, dict) or not isinstance(tasks.get("tasks"), list):
+        raise ValueError("任务文件格式损坏，请先备份并恢复 tasks.json")
+    return tasks
 
 
 def save_tasks(tasks):
+    global TASK_CACHE, TASK_CACHE_PATH
     write_json(TASKS_PATH, tasks)
+    TASK_CACHE, TASK_CACHE_PATH = copy.deepcopy(tasks), TASKS_PATH
+    METADATA_DIRTY.set()
 
 
 def recover_interrupted_tasks():
-    """A process cannot survive a console restart, so do not leave stale running tasks behind."""
+    """Resume interrupted work from per-file checkpoints, preserving its dependency IDs."""
     tasks = load_tasks()
     changed = False
     for task in tasks["tasks"]:
-        if task.get("status") == "running":
-            task["status"] = "interrupted"
-            task["finished_at"] = datetime.now().isoformat(timespec="seconds")
-            task["detail"] = "管理页或 NAS 重启，任务已中断；可重新创建任务继续。"
+        if task.get("status") in {"running", "interrupted"}:
+            task["status"] = "cancelled" if task.get("cancel_requested") else "paused" if task.get("pause_requested") else "queued"
+            task.pop("finished_at", None)
+            task["detail"] = "服务重启，已从文件检查点恢复排队。"
             changed = True
     if changed:
         save_tasks(tasks)
@@ -104,20 +131,22 @@ def session_from_headers(headers):
 
 def public_tasks():
     tasks = load_tasks()["tasks"]
-    active = [task for task in tasks if task.get("status") in {"queued", "running", "blocked"}]
+    active = [task for task in tasks if task.get("status") in {"queued", "running", "blocked", "paused"}]
     finished = [task for task in tasks if task not in active]
     tasks = active + list(reversed(finished))[:max(0, 20 - len(active))]
     result = []
     for task in tasks:
         item = dict(task)
-        if task.get("progress_file"):
+        if task["id"] in LIVE_PROGRESS:
+            item["progress"] = dict(LIVE_PROGRESS[task["id"]])
+        elif not STATE_READY and task.get("progress_file"):
             item["progress"] = read_json(OUTPUT_ROOT / task["progress_file"], {})
         result.append(item)
     return result
 
 
-def event_summary(date, total_files=0, processed_files=0, scan_status="pending"):
-    events = read_json(OUTPUT_ROOT / f"events-{date}.json", {})
+def event_summary(date, total_files=0, processed_files=0, scan_status="pending", events=None):
+    events = events if events is not None else read_json(OUTPUT_ROOT / f"events-{date}.json", {})
     groups = events.get("events", {})
     return {
         "date": date,
@@ -127,6 +156,8 @@ def event_summary(date, total_files=0, processed_files=0, scan_status="pending")
         "total_files": total_files,
         "processed_files": processed_files,
         "scan_status": scan_status,
+        "failed_files": events.get("failed_files", 0), "settings": events.get("settings", []),
+        "sample_seconds": events.get("sample_seconds"),
     }
 
 
@@ -142,9 +173,20 @@ def timelapses():
             stat = file.stat()
         except OSError:
             continue
+        if not stat.st_size:
+            continue
+        metadata = read_json(file.with_suffix(".json"), {})
+        if metadata.get("size_bytes") != stat.st_size or metadata.get("mtime_ns") != stat.st_mtime_ns or not metadata.get("validated"):
+            if not valid_video(file):
+                continue
+            metadata = {"status": "completed", "validated": True, "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+            write_json(file.with_suffix(".json"), metadata)
         items.append({"name": file.name, "camera": camera, "start_date": start_date,
                       "end_date": end_date or start_date, "size_bytes": stat.st_size,
-                      "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")})
+                      "status": metadata.get("status", "completed"),
+                      "failed_files": len(metadata.get("failed_files", [])),
+                      "scan_failed_files": metadata.get("scan_failed_files", 0),
+                      "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")})
     return sorted(items, key=lambda item: item["created_at"], reverse=True)
 
 
@@ -155,31 +197,27 @@ def exports_for_date(date, items=None):
 
 def indexed_records(root, database):
     """Reuse parsed filename metadata unless the NAS file changed."""
-    lock_path = database.parent / ".inventory-index.lock"
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        try:
-            age = time.time() - lock_path.stat().st_mtime
-            if age > 12 * 3600:
-                lock_path.unlink()
-                return indexed_records(root, database)
-        except OSError:
-            pass
-        raise RuntimeError("另一台设备正在建立录像索引，请稍后重试")
-    with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
-        lock_file.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
+        with shared_lock(database.parent / ".inventory-index.lock", timeout=1):
+            return build_inventory(root, database)
+    except TimeoutError as error:
+        raise RuntimeError("另一台设备正在建立录像索引，请稍后重试") from error
+
+
+def build_inventory(root, database):
     backup_path = database.with_suffix(".sqlite3.bak")
-    if database.exists():
-        shutil.copy2(database, backup_path)
     connection = sqlite3.connect(database)
-    connection.execute("""CREATE TABLE IF NOT EXISTS videos (
-        path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
-        camera TEXT NOT NULL, start TEXT NOT NULL, ending TEXT NOT NULL, seen TEXT NOT NULL)""")
-    scan_id = uuid.uuid4().hex
-    records, mp4_files = [], 0
-    previous_count = connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
     try:
+        if database.exists():
+            with sqlite3.connect(backup_path) as backup:
+                connection.backup(backup)
+        connection.execute("""CREATE TABLE IF NOT EXISTS videos (
+            path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
+            camera TEXT NOT NULL, start TEXT NOT NULL, ending TEXT NOT NULL, seen TEXT NOT NULL)""")
+        connection.execute("CREATE INDEX IF NOT EXISTS videos_start ON videos(start)")
+        scan_id = uuid.uuid4().hex
+        records, mp4_files = [], 0
+        previous_count = connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
         for path in root.rglob("*.mp4"):
             if not path.is_file():
                 continue
@@ -213,10 +251,6 @@ def indexed_records(root, database):
         connection.commit()
     finally:
         connection.close()
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
     return sorted(records, key=lambda item: item["start"]), mp4_files
 
 
@@ -271,15 +305,16 @@ def refresh_inventory():
                                 "index_database": str(INVENTORY_DB_PATH),
                                 "examples": [str(record["path"].relative_to(INPUT_ROOT)) for record in records[:3]]},
             }
-    except (OSError, RuntimeError) as error:  # A removable disk/share may disappear or another node owns the index.
+    except Exception as error:
         snapshot = {"updated_at": now, "records": records,
-                    "diagnostics": {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(), "message": str(error)}}
+                    "diagnostics": {"path": str(INPUT_ROOT), "available": bool(records), "message": str(error)}}
     # A large NAS scan can take longer than the cache TTL.  Stamp completion
     # time here, rather than its start time, to avoid immediately re-indexing.
     snapshot["updated_at"] = time.monotonic()
     with INVENTORY_LOCK:
         INVENTORY.update(snapshot)
         INVENTORY["indexing"] = False
+    METADATA_DIRTY.set()
 
 
 def inventory_snapshot():
@@ -294,7 +329,7 @@ def inventory_snapshot():
         snapshot["records"] = list(INVENTORY["records"])
         snapshot["diagnostics"] = dict(INVENTORY["diagnostics"])
         if snapshot["indexing"] and not snapshot["diagnostics"]:
-            snapshot["diagnostics"] = {"path": str(INPUT_ROOT), "available": INPUT_ROOT.is_dir(),
+            snapshot["diagnostics"] = {"path": str(INPUT_ROOT), "available": False,
                                        "message": "正在后台建立历史录像索引，请稍候…"}
         return snapshot
 
@@ -306,7 +341,7 @@ def available_dates(snapshot=None):
         records_by_day.setdefault(record["start"].strftime("%Y%m%d"), []).append(record)
     source_days = set(records_by_day)
     result_days = {path.stem.removeprefix("events-") for path in OUTPUT_ROOT.glob("events-*.json")}
-    processed_sources = set(load_ledger(OUTPUT_ROOT).get("sources", {}))
+    processed_sources = set(load_ledger(OUTPUT_ROOT, include_results=False).get("sources", {}))
     active_days = {}
     exported = timelapses()
     for task in load_tasks()["tasks"]:
@@ -316,20 +351,23 @@ def available_dates(snapshot=None):
     summaries = []
     for day in sorted(source_days | result_days, reverse=True):
         day_records = records_by_day.get(day, [])
+        events = read_json(OUTPUT_ROOT / f"events-{day}.json", {})
+        day_processed = (processed_sources | set(events.get("processed_sources", []))) - set(events.get("failed_sources", []))
         total_files = len(day_records)
-        processed_files = sum(source_id(record) in processed_sources for record in day_records)
+        processed_files = sum(source_id(record) in day_processed for record in day_records)
         if day in active_days:
             scan_status = "scanning" if active_days[day] == "running" else "queued"
         elif total_files and processed_files == total_files:
             scan_status = "completed"
-        elif processed_files:
+        elif processed_files or events.get("failed_files"):
             scan_status = "partial"
-        elif day in result_days:
+        elif day in result_days and events.get("schema_version") != 2:
             # Older releases may have a completed event file without a ledger entry.
             scan_status = "completed"
         else:
             scan_status = "pending"
-        summary = event_summary(day, total_files, processed_files, scan_status)
+        summary = event_summary(day, total_files, processed_files, scan_status, events)
+        summary["source_cameras"] = sorted({record["camera"] for record in day_records})
         summary["timelapse_count"] = len(exports_for_date(day, exported))
         summaries.append(summary)
     return summaries
@@ -350,14 +388,41 @@ def inventory_status():
         }
 
 
+def refresh_overview():
+    """All archive reads happen off the HTTP request path."""
+    snapshot = inventory_snapshot()
+    try:
+        dates = available_dates(snapshot)
+        library = timelapses()
+        OVERVIEW.update({"dates": dates, "timelapses": library, "diagnostics": snapshot["diagnostics"],
+                         "indexing": snapshot["indexing"], "updated_at": time.time()})
+    except Exception as error:
+        OVERVIEW["diagnostics"] = {"message": f"结果索引读取失败：{error}"}
+
+
+def metadata_loop():
+    while True:
+        METADATA_DIRTY.clear()
+        refresh_overview()
+        METADATA_DIRTY.wait(30)
+
+
+def status_snapshot():
+    tasks = public_tasks()
+    return {"tasks": tasks, "queue_paused": load_tasks().get("paused", False),
+            "queued_count": sum(t["status"] == "queued" for t in tasks),
+            "indexing": inventory_status()["indexing"]}
+
+
 def task_command(task):
-    command = [sys.executable, str(APP_ROOT / "person_timelapse.py")]
+    command = [sys.executable, "-u", str(APP_ROOT / "person_timelapse.py")]
     if task["kind"] == "scan":
         settings = PROFILES[task["profile"]]
         command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", task["date"],
+                    "--run-id", task["id"],
                     "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
                     "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
-        return command + (["--force"] if task.get("force") else [])
+        return command + (["--force"] if task.get("force") else []) + (["--retry-failed"] if task.get("retry_failed") else [])
     events = [str(OUTPUT_ROOT / f"events-{day}.json") for day in task["dates"]]
     return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
 
@@ -376,7 +441,7 @@ def dependency_state(task, tasks):
     if failed:
         days = "、".join(item.get("date", "未知日期") for item in failed)
         return "error", f"前置扫描未成功（{days}），范围延时未执行。"
-    if any(by_id[task_id].get("status") != "completed" for task_id in dependencies):
+    if any(by_id[task_id].get("status") not in {"completed", "partial"} for task_id in dependencies):
         return "waiting", "等待范围内的扫描任务完成"
     return "ready", ""
 
@@ -386,6 +451,11 @@ def validate_export_task(task):
     if missing:
         raise RuntimeError(f"缺少人物扫描结果：{missing[0]}{' 等' if len(missing) > 1 else ''}")
     event_count = 0
+    summaries = []
+    for day in task["dates"]:
+        events = read_json(OUTPUT_ROOT / f"events-{day}.json", {"events": {}})
+        summaries.append({"cameras": [camera for camera, found in events.get("events", {}).items() if found]})
+    task["camera"] = resolve_camera(summaries, task["camera"])
     for day in task["dates"]:
         events = read_json(OUTPUT_ROOT / f"events-{day}.json", {"events": {}})
         event_count += len(events.get("events", {}).get(task["camera"], []))
@@ -396,6 +466,8 @@ def validate_export_task(task):
 def resolve_camera(summaries, requested_camera):
     """Prefer the only camera that actually has person events in a range."""
     cameras = {camera for summary in summaries for camera in summary.get("cameras", [])}
+    if not cameras:
+        cameras = {camera for summary in summaries for camera in summary.get("source_cameras", [])}
     if requested_camera not in cameras and len(cameras) == 1:
         return cameras.pop()
     return requested_camera
@@ -418,11 +490,15 @@ def start_next_task():
             if mac_priority_active():
                 return
             tasks = load_tasks()
+            if tasks.get("paused"):
+                return
             if any(task["status"] == "running" for task in tasks["tasks"]):
                 return
-            changed, task = False, None
+            changed, task = repair_dependencies(tasks["tasks"]), None
             for candidate in tasks["tasks"]:
                 if candidate.get("status") != "queued":
+                    continue
+                if candidate.get("not_before", 0) > time.time():
                     continue
                 state, detail = dependency_state(candidate, tasks["tasks"])
                 if state == "waiting":
@@ -433,12 +509,12 @@ def start_next_task():
                 if state == "error":
                     candidate["status"] = "blocked"
                     candidate["detail"] = detail
-                    candidate["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    candidate["finished_at"] = now_iso()
                     changed = True
                     continue
                 task = candidate
                 task["status"] = "running"
-                task["started_at"] = datetime.now().isoformat(timespec="seconds")
+                task["started_at"] = now_iso()
                 task["detail"] = "任务已启动"
                 changed = True
                 break
@@ -448,43 +524,172 @@ def start_next_task():
                 break
             if not changed:
                 return
-    thread = threading.Thread(target=task_worker, args=(task, task_command(task), task["progress_file"]), daemon=True)
+    thread = threading.Thread(target=task_worker, args=(task, None, task["progress_file"]), daemon=True)
     thread.start()
+
+
+def repair_dependencies(tasks):
+    changed = False
+    for task in tasks:
+        if task.get("kind") != "export" or task.get("status") not in {"queued", "blocked"}:
+            continue
+        by_id = {item["id"]: item for item in tasks}
+        dependencies = list(task.get("depends_on", []))
+        if not dependencies:
+            for day in task["dates"]:
+                latest = next((item for item in reversed(tasks) if item.get("kind") == "scan" and item.get("date") == day
+                               and item.get("status") in {"queued", "running", "paused", "completed", "partial"}), None)
+                if latest:
+                    dependencies.append(latest["id"])
+        replacement = []
+        for identity in dependencies:
+            previous = by_id.get(identity, {})
+            if previous.get("status") in {"failed", "interrupted", "cancelled", "blocked"}:
+                newer = next((item for item in reversed(tasks) if item.get("kind") == "scan"
+                              and item.get("date") == previous.get("date")
+                              and item.get("status") in {"queued", "running", "completed", "partial", "paused"}), None)
+                if newer:
+                    identity = newer["id"]
+            replacement.append(identity)
+        if task.get("depends_on", []) != replacement:
+            task["depends_on"] = replacement
+            changed = True
+        if task["status"] == "blocked" and dependency_state(task, tasks)[0] != "error":
+            task["status"], task["detail"] = "queued", "前置扫描已恢复，重新等待合成。"
+            task.pop("finished_at", None)
+            changed = True
+    return changed
+
+
+def terminate_process(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+    except ProcessLookupError:
+        pass
+
+
+def scheduler_loop():
+    while True:
+        try:
+            start_next_task()
+        except Exception as error:
+            print(f"[scheduler] {error}", flush=True)
+        SCHEDULER_WAKE.wait(5)
+        SCHEDULER_WAKE.clear()
 
 
 def task_worker(task, command, progress_file):
     task_id = task["id"]
     environment = os.environ.copy()
-    progress_path = OUTPUT_ROOT / progress_file
+    runtime = Path(os.environ.get("RUNTIME_ROOT", tempfile.gettempdir())) / "person-timelapse"
+    progress_path = runtime / progress_file
     environment["PROGRESS_PATH"] = str(progress_path)
-    write_json(progress_path, {
+    environment["INVENTORY_DB_PATH"] = str(INVENTORY_DB_PATH)
+    initial = {
         "phase": "starting",
         "percent": 0,
         "elapsed_seconds": 0,
         "current_file": "正在加载人物识别模型…",
-    })
+        "heartbeat_at": time.time(),
+    }
+    LIVE_PROGRESS[task_id] = initial
     process = None
+    log_path = None
+    timed_out = False
     try:
+        runtime.mkdir(parents=True, exist_ok=True)
+        write_json(progress_path, initial)
         if task["kind"] == "export":
             validate_export_task(task)
-        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
-        PROCESSES[task_id] = process
-        detail, _ = process.communicate()
-        status = "completed" if process.returncode == 0 else "failed"
-        detail = detail.strip()[-4000:]
+        command = task_command(task)
+        with LOCK:
+            current = load_tasks()
+            saved = next(item for item in current["tasks"] if item["id"] == task_id)
+            saved["camera"] = task["camera"]
+            if saved.get("cancel_requested") or saved.get("pause_requested"):
+                raise RuntimeError("任务在启动前已请求停止")
+            save_tasks(current)
+        log_path = runtime / f"task-{task_id}.log"
+        print(f"[task {task_id}] starting {task['kind']} {task['date']}", flush=True)
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment, start_new_session=True)
+            PROCESSES[task_id] = process
+            while process.poll() is None:
+                progress = read_json(progress_path, LIVE_PROGRESS[task_id])
+                LIVE_PROGRESS[task_id] = progress
+                heartbeat = progress.get("heartbeat_at", initial["heartbeat_at"])
+                if time.time() - heartbeat > STALLED_SECONDS:
+                    timed_out = True
+                    terminate_process(process)
+                    break
+                with LOCK:
+                    saved = next(item for item in load_tasks()["tasks"] if item["id"] == task_id)
+                if saved.get("cancel_requested") or saved.get("pause_requested"):
+                    terminate_process(process)
+                    break
+                time.sleep(1)
+        with log_path.open("rb") as log:
+            log.seek(max(0, log_path.stat().st_size - 4000))
+            detail = log.read().decode("utf-8", errors="replace").strip()
+        status = ("completed" if process.returncode == 0 else "partial" if process.returncode == 2 else
+                  "queued" if process.returncode == 3 else "failed")
+        if timed_out:
+            source = LIVE_PROGRESS[task_id].get("source")
+            if task["kind"] == "scan" and source:
+                record = {"path": Path(source["path"]), "camera": source["camera"],
+                          "start": datetime.fromisoformat(source["start"]), "end": datetime.fromisoformat(source["end"]),
+                          "size": int(source["source_id"].rsplit(":", 1)[1])}
+                commit_result(OUTPUT_ROOT, record, source["settings"], error="文件处理超时，已跳过；可单独重试", run_id=task_id)
+                status = "queued" if task.get("timeout_retries", 0) < 10 else "partial"
+            detail = f"超过 {STALLED_SECONDS:g} 秒没有进度，已停止卡住的进程。" + detail[-2000:]
+        LIVE_PROGRESS[task_id] = read_json(progress_path, LIVE_PROGRESS[task_id])
     except Exception as error:  # pragma: no cover - defensive boundary for background work
         status = "failed"
         detail = str(error)
+    finally:
+        if process and process.poll() is None:
+            terminate_process(process)
+    final_status = status
     with LOCK:
         PROCESSES.pop(task_id, None)
         tasks = load_tasks()
         for task in tasks["tasks"]:
             if task["id"] == task_id:
-                task["status"] = "cancelled" if task.get("cancel_requested") else status
-                task["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                task["status"] = ("cancelled" if task.get("cancel_requested") else
+                                  ("paused" if tasks.get("paused") else "queued") if task.get("pause_requested") else status)
+                if task["status"] == "queued":
+                    task.pop("pause_requested", None)
+                    task.pop("finished_at", None)
+                else:
+                    task["finished_at"] = now_iso()
+                if task["status"] == "paused":
+                    detail = "已暂停；已完成文件的检查点已保留。"
+                elif task["status"] == "cancelled":
+                    detail = "任务已取消；已完成的结果已保留。"
                 task["detail"] = detail
+                final_status = task["status"]
+                if status == "queued":
+                    if timed_out:
+                        task["timeout_retries"] = task.get("timeout_retries", 0) + 1
+                        task["retry_failed"] = False
+                    else:
+                        task["not_before"] = time.time() + 30
+                else:
+                    task.pop("not_before", None)
         save_tasks(tasks)
+    if log_path and log_path.exists():
+        try:
+            shutil.copy2(log_path, OUTPUT_ROOT / log_path.name)
+        except OSError as error:
+            print(f"[task {task_id}] 日志归档失败：{error}", flush=True)
     start_next_task()
+    print(f"[task {task_id}] {final_status}: {detail[-2000:]}", flush=True)
 
 
 def create_task(payload):
@@ -503,7 +708,8 @@ def create_task(payload):
     end_date = payload.get("end_date") or date
     if not DATE_PATTERN.fullmatch(end_date) or end_date < date:
         raise ValueError("结束日期无效")
-    summaries = [item for item in available_dates(inventory_snapshot()) if date <= item["date"] <= end_date]
+    all_dates = OVERVIEW["dates"] if STATE_READY else available_dates(inventory_snapshot())
+    summaries = [item for item in all_dates if date <= item["date"] <= end_date]
     dates = [item["date"] for item in sorted(summaries, key=lambda item: item["date"])]
     if not dates:
         raise ValueError("该日期范围内没有已索引的录像。")
@@ -531,24 +737,32 @@ def create_task(payload):
                 for day in item.get("dates", [item.get("date")])
             }
             selected = []
+            settings = PROFILES[profile]
+            requested = scan_settings(float(settings["sample_seconds"]), .45, 20,
+                                      float(settings["motion_threshold"]), 60, int(settings["imgsz"]))
             for item in sorted(summaries, key=lambda item: item["date"]):
                 event_exists = (OUTPUT_ROOT / f"events-{item['date']}.json").exists()
-                needs_scan = item["scan_status"] not in {"completed", "queued", "scanning"}
+                quality_change = any(not settings_satisfied({"settings": previous}, requested)
+                                     for previous in item.get("settings", []))
+                legacy_upgrade = item.get("sample_seconds") and item["sample_seconds"] > requested["sample_seconds"]
+                force = payload.get("force") is True or bool(legacy_upgrade)
+                needs_scan = item["scan_status"] not in {"completed", "queued", "scanning"} or quality_change or force
                 if kind == "timelapse":
                     needs_scan = needs_scan or not event_exists
                 active_task = active_scans.get(item["date"])
                 if active_task:
                     dependency_ids.append(active_task["id"])
                 elif needs_scan:
-                    selected.append((item, item["scan_status"] == "completed" and not event_exists))
+                    selected.append((item, force or (item["scan_status"] == "completed" and not event_exists)))
             if kind == "scan" and not selected:
                 raise ValueError("这个范围内的录像均已完成扫描，或已在队列中。")
             for item, force in selected:
                 task = {
                     "id": uuid.uuid4().hex[:8], "kind": "scan", "date": item["date"],
                     "camera": None, "profile": profile, "status": "queued",
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "created_at": now_iso(),
                     "detail": "等待扫描", "dates": [item["date"]], "force": force,
+                    "retry_failed": payload.get("retry_failed") is True or kind == "scan" or force,
                 }
                 task["progress_file"] = f"progress-{task['id']}.json"
                 tasks["tasks"].append(task)
@@ -559,7 +773,7 @@ def create_task(payload):
             task = {
                 "id": uuid.uuid4().hex[:8], "kind": "export", "date": date,
                 "camera": camera or None, "profile": None, "status": "queued",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "created_at": now_iso(),
                 "detail": "等待范围扫描后导出" if kind == "timelapse" else "等待导出", "dates": dates,
                 "depends_on": sorted(set(dependency_ids)),
             }
@@ -576,9 +790,9 @@ def cancel_task(task_id):
     with LOCK:
         tasks = load_tasks()
         task = next((item for item in tasks["tasks"] if item["id"] == task_id), None)
-        if not task or task["status"] not in {"running", "queued"}:
+        if not task or task["status"] not in {"running", "queued", "paused", "blocked"}:
             raise ValueError("没有可取消的任务")
-        if task["status"] == "queued":
+        if task["status"] != "running":
             task["status"] = "cancelled"
             task["detail"] = "已从队列移除"
             save_tasks(tasks)
@@ -586,13 +800,45 @@ def cancel_task(task_id):
         task["cancel_requested"] = True
         task["detail"] = "正在停止任务…"
         save_tasks(tasks)
-        process = PROCESSES.get(task_id)
-        if process:
-            process.terminate()
     return {"id": task_id, "status": "cancelling"}
 
 
+def retry_task(task_id):
+    with LOCK:
+        tasks = load_tasks()
+        task = next((item for item in tasks["tasks"] if item["id"] == task_id), None)
+        if not task or task["status"] in {"running", "queued"}:
+            raise ValueError("该任务不需要重试")
+        task.update(status="queued", detail="已重新排队，将跳过已成功处理的文件。", retry_failed=True, timeout_retries=0)
+        for key in ("cancel_requested", "pause_requested", "finished_at", "not_before"):
+            task.pop(key, None)
+        save_tasks(tasks)
+    SCHEDULER_WAKE.set()
+    return {"id": task_id, "status": "queued"}
+
+
+def queue_action(action):
+    if action not in {"pause", "resume"}:
+        raise ValueError("队列操作无效")
+    with LOCK:
+        tasks = load_tasks()
+        tasks["paused"] = action == "pause"
+        for task in tasks["tasks"]:
+            if action == "pause" and task["status"] == "running":
+                task["pause_requested"] = True
+                task["detail"] = "正在保存检查点并暂停…"
+            elif action == "resume" and task["status"] == "paused":
+                task["status"] = "queued"
+                task.pop("pause_requested", None)
+        save_tasks(tasks)
+    SCHEDULER_WAKE.set()
+    return {"queue_paused": tasks["paused"]}
+
+
 class ConsoleHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(APP_ROOT), **kwargs)
+
     def log_message(self, format, *args):
         print(f"[web] {format % args}", flush=True)
 
@@ -606,8 +852,11 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def authenticated(self):
         return bool(session_from_headers(self.headers))
@@ -634,10 +883,10 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "inventory": inventory_status()})
             return
         if path == "/api/overview":
-            snapshot = inventory_snapshot()
-            self.send_json({"dates": available_dates(snapshot), "timelapses": timelapses(),
-                            "tasks": public_tasks(), "profiles": PROFILES,
-                            "diagnostics": source_diagnostics(snapshot), "indexing": snapshot["indexing"]})
+            self.send_json({**OVERVIEW, **status_snapshot(), "profiles": PROFILES})
+            return
+        if path == "/api/status":
+            self.send_json(status_snapshot())
             return
         if path.startswith("/api/date/"):
             date = path.rsplit("/", 1)[-1]
@@ -645,12 +894,14 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 self.send_json({"error": "日期无效"}, HTTPStatus.BAD_REQUEST)
                 return
             events = read_json(OUTPUT_ROOT / f"events-{date}.json", {"date": date, "events": {}})
-            self.send_json({"events": events, "exports": exports_for_date(date)})
+            self.send_json({"events": events, "exports": exports_for_date(date, OVERVIEW["timelapses"])})
             return
         if path.startswith("/media/"):
             relative = Path(unquote(path.removeprefix("/media/")))
             target = (OUTPUT_ROOT / relative).resolve()
-            if OUTPUT_ROOT.resolve() not in target.parents or not target.is_file():
+            if (OUTPUT_ROOT.resolve() not in target.parents or not target.is_file()
+                    or target.suffix.lower() not in {".mp4", ".jpg", ".jpeg", ".png"}
+                    or any(part.startswith(".") for part in relative.parts)):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self.send_response(HTTPStatus.OK)
@@ -662,12 +913,19 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return
         if path in {"/", "/index.html"}:
             self.path = "/web/index.html"
-        elif path.startswith("/web/"):
+        elif path in {"/web/index.html", "/web/login.html"}:
             self.path = path
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         return super().do_GET()
+
+    def do_HEAD(self):
+        # The inherited handler would inspect arbitrary files in the working
+        # directory without going through our authentication and route checks.
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "GET, POST, DELETE")
+        self.end_headers()
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -675,7 +933,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 password = json.loads(self.rfile.read(length)).get("password", "")
-                if not hmac.compare_digest(password, ACCESS_PASSWORD):
+                if not isinstance(password, str) or not hmac.compare_digest(password.encode(), ACCESS_PASSWORD.encode()):
                     self.send_json({"error": "密码错误"}, HTTPStatus.UNAUTHORIZED)
                     return
                 token = secrets.token_urlsafe(32)
@@ -688,13 +946,22 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return
         if self.require_login():
             return
-        if path != "/api/tasks":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length))
-            self.send_json(create_task(payload), HTTPStatus.CREATED)
+            payload = json.loads(self.rfile.read(length)) if length else {}
+            if path == "/api/tasks":
+                self.send_json(create_task(payload), HTTPStatus.CREATED)
+            elif path == "/api/queue":
+                self.send_json(queue_action(payload.get("action")))
+            elif path.startswith("/api/tasks/") and path.endswith("/retry"):
+                self.send_json(retry_task(path.split("/")[-2]))
+            elif path == "/api/index":
+                with INVENTORY_LOCK:
+                    INVENTORY["updated_at"] = 0
+                inventory_snapshot()
+                self.send_json({"indexing": True})
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
         except (ValueError, RuntimeError) as error:
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
@@ -712,11 +979,14 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global ACCESS_PASSWORD
+    global ACCESS_PASSWORD, STATE_READY, TASK_CACHE, TASK_CACHE_PATH
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     ACCESS_PASSWORD = load_access_password()
     recover_interrupted_tasks()
-    start_next_task()
+    TASK_CACHE, TASK_CACHE_PATH = load_tasks(), TASKS_PATH
+    STATE_READY = True
+    threading.Thread(target=metadata_loop, daemon=True, name="result-metadata").start()
+    threading.Thread(target=scheduler_loop, daemon=True, name="task-scheduler").start()
     inventory_snapshot()
     port = int(os.environ.get("PORT", "8790"))
     server = ThreadingHTTPServer(("0.0.0.0", port), ConsoleHandler)

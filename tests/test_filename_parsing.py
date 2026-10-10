@@ -12,19 +12,8 @@ SPEC = importlib.util.spec_from_file_location("person_timelapse", MODULE)
 MODULE_UNDER_TEST = importlib.util.module_from_spec(SPEC)
 
 
-class StubCV2:
-    pass
-
-
-class StubYOLO:
-    pass
-
-
 import sys
-sys.modules.setdefault("cv2", StubCV2())
-ultralytics = type(sys)("ultralytics")
-ultralytics.YOLO = StubYOLO
-sys.modules.setdefault("ultralytics", ultralytics)
+sys.path.insert(0, str(MODULE.parent))
 SPEC.loader.exec_module(MODULE_UNDER_TEST)
 
 
@@ -89,4 +78,4 @@ class FilenameParsingTests(unittest.TestCase):
                 else:
                     os.environ["PROGRESS_PATH"] = previous
             self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["percent"], 12.5)
-            self.assertFalse(target.with_suffix(".tmp").exists())
+            self.assertEqual(list(target.parent.glob(f".{target.name}-*")), [])

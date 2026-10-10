@@ -95,7 +95,10 @@ class ScanStatusTests(unittest.TestCase):
             output = Path(directory)
             original_output = WEB.OUTPUT_ROOT
             WEB.OUTPUT_ROOT = output
-            (output / "people-timelapse-0-20260301-20260303.mp4").write_bytes(b"video")
+            video = output / "people-timelapse-0-20260301-20260303.mp4"
+            video.write_bytes(b"video")
+            (video.with_suffix(".json")).write_text(json.dumps({"validated": True,
+                "size_bytes": video.stat().st_size, "mtime_ns": video.stat().st_mtime_ns}), encoding="utf-8")
             records = [
                 {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
                  "path": Path(f"{day}.mp4"), "size": day}
@@ -151,7 +154,7 @@ class ScanStatusTests(unittest.TestCase):
         self.assertEqual(WEB.dependency_state(tasks[1], tasks)[0], "error")
         self.assertIn("20260301", WEB.dependency_state(tasks[1], tasks)[1])
 
-    def test_export_validation_explains_camera_without_person_events(self):
+    def test_export_validation_resolves_camera_after_scan(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             original_output = WEB.OUTPUT_ROOT
@@ -161,8 +164,9 @@ class ScanStatusTests(unittest.TestCase):
                 encoding="utf-8",
             )
             try:
-                with self.assertRaisesRegex(RuntimeError, "0 路的人物事件"):
-                    WEB.validate_export_task({"dates": ["20260301"], "camera": "0"})
+                task = {"dates": ["20260301"], "camera": "0"}
+                WEB.validate_export_task(task)
+                self.assertEqual(task["camera"], "10")
             finally:
                 WEB.OUTPUT_ROOT = original_output
 
@@ -237,7 +241,8 @@ class ScanStatusTests(unittest.TestCase):
             WEB.INPUT_ROOT, WEB.OUTPUT_ROOT, WEB.INVENTORY_DB_PATH = source, output, output / "inventory.sqlite3"
             WEB.INVENTORY = {"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": True}
             try:
-                with patch.object(WEB.time, "monotonic", side_effect=[10.0, 51.0]):
+                with patch.object(WEB.time, "monotonic", side_effect=[10.0, 51.0]), \
+                        patch.object(WEB, "indexed_records", return_value=([], 1)):
                     WEB.refresh_inventory()
                 self.assertEqual(WEB.INVENTORY["updated_at"], 51.0)
             finally:

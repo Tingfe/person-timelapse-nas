@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -13,11 +14,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/Volumes/camera-recordings/延时摄影"))
-PROGRESS_PATH = OUTPUT_ROOT / "progress-mac-worker.json"
+PROGRESS_PATH = ROOT / ".mac-worker-state" / "progress.json"
 PROCESS = None
 PROCESS_KIND = None
 LOGS = []
 LOCK = threading.Lock()
+STARTING = False
+STOP_REQUESTED = False
+LAST_EXIT_CODE = None
 
 
 PAGE = """<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Mac 影像协处理</title><style>
@@ -39,15 +43,20 @@ PAGE = PAGE.replace(
 
 def status():
     with LOCK:
-        running = PROCESS is not None and PROCESS.poll() is None
+        running = STARTING or (PROCESS is not None and PROCESS.poll() is None)
         kind = PROCESS_KIND
         logs = LOGS[-200:]
     try:
         progress = json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         progress = {}
-    detail = "Mac 正在通过 SMB 建立共享日期索引；期间不要让 NAS 同时建索引。" if kind == "index" else "Mac 与 NAS 之间仅通过 SMB 读写。" if running else "可建立索引或开始新的小批次扫描。"
-    return {"running": running, "kind": kind, "detail": detail, "logs": logs, "progress": progress if kind == "scan" else {}}
+    detail = ("Mac 正在建立共享索引，索引锁会协调 NAS。" if kind == "index" else
+              "正在扫描；每完成一个文件即保存检查点。" if running else
+              "上次任务完成。" if LAST_EXIT_CODE == 0 else
+              "本次部分完成；已保存成功文件，失败文件可重新扫描。" if LAST_EXIT_CODE == 2 else
+              "任务已停止或失败，请查看日志。" if LAST_EXIT_CODE is not None else "可建立索引或开始扫描。")
+    return {"running": running, "kind": kind, "detail": detail, "logs": logs,
+            "exit_code": LAST_EXIT_CODE, "progress": progress if kind == "scan" or not running else {}}
 
 
 def available_dates():
@@ -63,19 +72,46 @@ def available_dates():
 
 
 def run_process(kind, command, environment):
-    global PROCESS, PROCESS_KIND
+    global PROCESS, PROCESS_KIND, STARTING, LAST_EXIT_CODE
+    process = None
     try:
         with LOCK:
             PROCESS_KIND = kind
-            PROCESS = subprocess.Popen(command, cwd=ROOT, env=environment,
+            process = subprocess.Popen(command, cwd=ROOT, env=environment,
                                        text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, bufsize=1)
-        for line in PROCESS.stdout:
-            with LOCK: LOGS.append(line.rstrip())
+                                       stderr=subprocess.STDOUT, bufsize=1, start_new_session=True)
+            PROCESS = process
+            STARTING = False
+            stopped = STOP_REQUESTED
+        if stopped:
+            stop_process(process)
+        for line in process.stdout:
+            with LOCK:
+                LOGS.append(line.rstrip())
+                del LOGS[:-1000]
+        LAST_EXIT_CODE = process.wait()
+    except Exception as error:
+        with LOCK:
+            LOGS.append(f"任务失败：{error}")
+        LAST_EXIT_CODE = 1
     finally:
+        if process and process.poll() is None:
+            stop_process(process)
         with LOCK:
             PROCESS = None
             PROCESS_KIND = None
+            STARTING = False
+
+
+def stop_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+    except ProcessLookupError:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -87,16 +123,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/api/dates': return self.reply(available_dates())
         self.send_response(HTTPStatus.OK);self.send_header('Content-Type','text/html;charset=utf-8');self.end_headers();self.wfile.write(PAGE.encode())
     def do_POST(self):
-        global PROCESS
+        global PROCESS, STARTING, STOP_REQUESTED, PROCESS_KIND
         if self.path=='/api/stop':
             with LOCK:
-                if PROCESS and PROCESS.poll() is None: PROCESS.terminate(); LOGS.append('已请求停止当前批次。')
+                STOP_REQUESTED = True
+                if PROCESS and PROCESS.poll() is None:
+                    threading.Thread(target=stop_process, args=(PROCESS,), daemon=True).start()
+                    LOGS.append('已请求停止；成功处理的文件检查点会保留。')
             return self.reply(status())
         if self.path == '/api/index':
             with LOCK:
-                if PROCESS and PROCESS.poll() is None:
+                if STARTING or (PROCESS and PROCESS.poll() is None):
                     return self.reply({'error': '已有任务正在运行'}, HTTPStatus.CONFLICT)
                 LOGS.clear(); LOGS.append('准备通过 Mac 建立共享 NAS 日期索引。')
+                STARTING, STOP_REQUESTED, PROCESS_KIND = True, False, "index"
             threading.Thread(target=run_process, args=("index", ["sh", str(ROOT / "mac-index.sh")], dict(os.environ)), daemon=True).start()
             return self.reply(status())
         if self.path!='/api/start': return self.reply({'error':'not found'},HTTPStatus.NOT_FOUND)
@@ -104,9 +144,10 @@ class Handler(BaseHTTPRequestHandler):
             data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))));date=data['date'];limit=int(data.get('limit',data.get('batches',5)));require_ac=bool(data.get('require_ac',True))
             if not (date.isdigit() and len(date)==8 and 1<=limit<=250): raise ValueError('日期或本次处理文件数无效')
             with LOCK:
-                if PROCESS and PROCESS.poll() is None: raise ValueError('已有任务正在运行')
+                if STARTING or (PROCESS and PROCESS.poll() is None): raise ValueError('已有任务正在运行')
                 LOGS.clear();LOGS.append(f'准备处理 {date}，本次最多 {limit} 个未处理文件。')
-            environment = dict(os.environ, REQUIRE_AC="1" if require_ac else "0")
+                STARTING, STOP_REQUESTED, PROCESS_KIND = True, False, "scan"
+            environment = dict(os.environ, REQUIRE_AC="1" if require_ac else "0", PROGRESS_PATH=str(PROGRESS_PATH))
             command = ["sh", str(ROOT / "mac-worker.sh"), date, str(limit)]
             threading.Thread(target=run_process,args=("scan", command, environment),daemon=True).start();return self.reply(status())
         except (ValueError,json.JSONDecodeError) as error: return self.reply({'error':str(error)},HTTPStatus.BAD_REQUEST)

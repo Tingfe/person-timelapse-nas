@@ -10,17 +10,21 @@ VENV=${VENV:-"$PWD/.mac-worker-venv"}
 REQUIRE_AC=${REQUIRE_AC:-1}
 MAC_PRIORITY=${MAC_PRIORITY:-1}
 PRIORITY_PATH="$OUTPUT_ROOT/.mac-priority.lock"
-PROGRESS_PATH=${PROGRESS_PATH:-"$OUTPUT_ROOT/progress-mac-worker.json"}
+PROGRESS_PATH=${PROGRESS_PATH:-"$PWD/.mac-worker-state/progress.json"}
+INVENTORY_DB_PATH="$OUTPUT_ROOT/inventory.sqlite3"
 
 [ -d "$INPUT_ROOT" ] || { echo "NAS 录像目录未挂载：$INPUT_ROOT"; exit 1; }
 [ -d "$OUTPUT_ROOT" ] || { echo "NAS 输出目录不可用：$OUTPUT_ROOT"; exit 1; }
+mkdir -p "$(dirname "$PROGRESS_PATH")"
 rm -f "$PROGRESS_PATH"
 
 heartbeat=""
 if [ "$MAC_PRIORITY" = "1" ]; then
   printf 'mac=%s started=%s\n' "$(hostname)" "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$PRIORITY_PATH"
   (while :; do sleep 60; touch "$PRIORITY_PATH" 2>/dev/null || exit; done) & heartbeat=$!
-  trap 'kill "$heartbeat" 2>/dev/null || true; rm -f "$PRIORITY_PATH"' EXIT INT TERM
+  trap 'kill "$heartbeat" 2>/dev/null || true; rm -f "$PRIORITY_PATH"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   echo "Mac 已取得计算优先权；NAS 不会启动新的扫描任务。"
 fi
 
@@ -40,7 +44,7 @@ fi
 
 if [ "$REQUIRE_AC" = "1" ] && ! pmset -g batt | grep -q "AC Power"; then
   echo "Mac 未接电，停止领取任务；接电后重新点击开始即可续接。"
-  exit 0
+  exit 3
 fi
 echo "[Mac worker] ${DATE}：本次最多处理 ${MAX_FILES} 个未处理文件，可随时 Ctrl-C"
-MODEL_PATH="$MODEL_PATH" PROGRESS_PATH="$PROGRESS_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit "$MAX_FILES" --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256
+MODEL_PATH="$MODEL_PATH" PROGRESS_PATH="$PROGRESS_PATH" INVENTORY_DB_PATH="$INVENTORY_DB_PATH" "$VENV/bin/python" app/person_timelapse.py scan "$INPUT_ROOT" "$OUTPUT_ROOT" --date "$DATE" --limit "$MAX_FILES" --device mps --sample-seconds 120 --motion-threshold 8 --imgsz 256 --retry-failed

@@ -20,3 +20,5 @@ models/**
 .DS_Store
 __pycache__/
 *.py[cod]
+.mac-worker-venv/
+.mac-worker-state/

@@ -12,3 +12,5 @@ models/
 *.png
 *.log
 __pycache__/
+.mac-worker-venv/
+.mac-worker-state/

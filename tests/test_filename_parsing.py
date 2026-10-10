@@ -19,10 +19,10 @@ SPEC.loader.exec_module(MODULE_UNDER_TEST)
 
 class FilenameParsingTests(unittest.TestCase):
     def test_parse_xiaomi_filename(self):
-        record = MODULE_UNDER_TEST.parse_record(Path("10_20000101092000_20000101093000.mp4"))
+        record = MODULE_UNDER_TEST.parse_record(Path("10_20000101090000_20000101091000.mp4"))
         self.assertEqual(record["camera"], "10")
-        self.assertEqual(record["start"], datetime(2000, 1, 1, 9, 20, 0))
-        self.assertEqual(record["end"], datetime(2000, 1, 1, 9, 30, 0))
+        self.assertEqual(record["start"], datetime(2000, 1, 1, 9, 0, 0))
+        self.assertEqual(record["end"], datetime(2000, 1, 1, 9, 10, 0))
 
     def test_reject_non_xiaomi_filename(self):
         self.assertIsNone(MODULE_UNDER_TEST.parse_record(Path("holiday.mp4")))

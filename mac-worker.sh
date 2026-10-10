@@ -5,7 +5,7 @@ set -eu
 DATE=${1:?"Usage: ./mac-worker.sh YYYYMMDD [max_files]"}
 MAX_FILES=${2:-5}
 INPUT_ROOT=${INPUT_ROOT:-"/Volumes/camera-recordings"}
-OUTPUT_ROOT=${OUTPUT_ROOT:-"/Volumes/camera-recordings/延时摄影"}
+OUTPUT_ROOT=${OUTPUT_ROOT:-"$INPUT_ROOT/延时摄影"}
 VENV=${VENV:-"$PWD/.mac-worker-venv"}
 REQUIRE_AC=${REQUIRE_AC:-1}
 MAC_PRIORITY=${MAC_PRIORITY:-1}

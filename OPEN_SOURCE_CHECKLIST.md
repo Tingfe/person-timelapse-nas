@@ -14,9 +14,17 @@
 1. 执行 `git status --ignored`，确认真实视频只出现在 ignored 区域；
 2. 执行 `git check-ignore -v data/* output/* models/yolo11n.pt`，确认排除规则生效；
 3. 执行 `git ls-files`，确认清单中没有 `.mp4`、`.jpg`、`events-*.json`、`processed.json`、`tasks.json` 或 `*.log`；
-4. 在 Docker Hub 构建前执行 `docker build --no-cache .`，构建上下文不应包含 `data/`、`output/`、`models/`；
+4. 检查 `.dockerignore` 的白名单，并检查镜像各层及构建记录；不要仅检查容器最终目录，也不必为隐私检查清空构建缓存；
 5. 不要在 README、Issue、截图或日志中粘贴家庭成员画面、精确录像时间、NAS 名称、局域网 IP、挂载路径、账号或令牌；
 6. 仅发布空目录占位文件 `models/.gitkeep` 和 `output/.gitkeep`，不要发布模型权重。
+
+## 历史与发布记录
+
+- `.gitignore` 只保护尚未跟踪的文件，不能清除已经提交的历史内容；改写历史前先保存私有备份，并通知协作者重新克隆，避免把旧历史再次推回。
+- 检查提交作者邮箱、所有公开分支/标签、Actions 日志与附件，以及镜像标签、环境变量、构建来源元数据。构建工具可能打印事件中的邮箱，即使 Git 提交使用了匿名邮箱。
+- 镜像发布前先屏蔽事件邮箱，默认不上传公开的 `.dockerbuild` 构建记录。凭据只保存在 Actions Secrets 中，不进入构建参数或镜像层。
+- Docker Hub Overview 从公开 README 同步，因此 README 也不得包含真实挂载路径、密码、家庭画面或真实录像时间；请使用虚构文件名。
+- 如凭据曾经公开，先撤销或更换凭据；删除文件或改写历史不能令已经复制的凭据失效。平台缓存与他人的克隆副本需要另行处理。
 
 ## 许可证提醒
 

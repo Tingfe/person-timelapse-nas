@@ -1,0 +1,36 @@
+name: Sync Docker Hub overview
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - OPEN_SOURCE_CHECKLIST.md
+      - scripts/sync_dockerhub_overview.py
+      - tests/test_publication.py
+      - .github/workflows/dockerhub-overview.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-overview
+  cancel-in-progress: false
+
+jobs:
+  overview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run publication regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate public overview
+        run: python3 scripts/sync_dockerhub_overview.py --check
+      - name: Sync and verify Docker Hub description
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: python3 scripts/sync_dockerhub_overview.py

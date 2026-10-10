@@ -23,6 +23,8 @@
 
 镜像已公开发布至 Docker Hub：[`tingfe/person-timelapse-nas`](https://hub.docker.com/r/tingfe/person-timelapse-nas)。推荐使用 Compose 部署：
 
+当前发布的镜像仅支持 **Linux ARM64**，适用于极空间 Z2 Pro 等 ARM64 设备；Intel/AMD 的 x86 NAS 暂不能直接使用此镜像。
+
 ```yaml
 services:
   person-timelapse:
@@ -124,8 +126,10 @@ image: tingfe/person-timelapse-nas:sha-提交哈希
 Apple Silicon Mac 可用 Metal/MPS 参与计算。将 NAS 的录像目录与 `延时摄影` 输出目录通过 SMB 挂载到 Mac 后，在本仓库运行：
 
 ```sh
+export INPUT_ROOT="/Volumes/camera-recordings"
+export OUTPUT_ROOT="$INPUT_ROOT/延时摄影"
 chmod +x mac-worker.sh
-./mac-worker.sh 20260324 5
+./mac-worker.sh 20000101 5
 ```
 
 也可以启动仅限本机访问的可视化控制台：
@@ -133,6 +137,8 @@ chmod +x mac-worker.sh
 ```sh
 sh mac-console.sh
 ```
+
+`/Volumes/camera-recordings` 是通用示例，请先将 `INPUT_ROOT` 改为自己实际的 SMB 挂载目录；`OUTPUT_ROOT` 必须与 NAS 容器的 `/output` 指向同一目录。在同一个终端启动控制台和索引工具，以便继承这些环境变量。示例日期与文件名均为虚构，请换成自己的录像日期。
 
 随后打开 `http://127.0.0.1:8791`，选择日期和本次最多处理的文件数，一键启动或停止；日志会直接显示在页面内。
 
@@ -165,15 +171,15 @@ video_0000_10_10_20000102090000_20000102093000.mp4
 Web 管理页已覆盖常用操作。如需在容器终端运行：
 
 ```sh
-python /opt/person-timelapse/person_timelapse.py scan /input /output --date 20260324
-python /opt/person-timelapse/person_timelapse.py export /input /output /output/events-20260324.json --camera 0
+python /opt/person-timelapse/person_timelapse.py scan /input /output --date 20000101
+python /opt/person-timelapse/person_timelapse.py export /input /output /output/events-20000101.json --camera 0
 ```
 
 多日导出可连续传入多个事件文件：
 
 ```sh
 python /opt/person-timelapse/person_timelapse.py export /input /output \
-  /output/events-20260323.json /output/events-20260324.json --camera 0
+  /output/events-20000101.json /output/events-20000102.json --camera 0
 ```
 
 ## 隐私与安全
@@ -185,6 +191,10 @@ python /opt/person-timelapse/person_timelapse.py export /input /output \
 ## 开发与发布
 
 推送到 `main` 后，GitHub Actions 会先运行可靠性回归测试，通过后才构建 ARM64 镜像并发布 `latest` 与 `sha-提交哈希` 标签。维护者需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`；使用者不需要任何 Docker Hub 凭据。
+
+Docker Hub 的短介绍与 Overview 由独立的 `Sync Docker Hub overview` 流程维护：README 修改后自动同步，也可在 Actions 中手动运行。它复用上述 Secrets，不重建镜像；发布后读回内容校验，失败会明确报错。Docker Hub 上的文档链接会自动指向 GitHub，不依赖相对路径。发布流程会屏蔽事件中的邮箱，并关闭包含额外构建元数据的公开构建记录附件；不要在流水线中打印完整环境变量、事件或凭据。
+
+维护者也可手动运行 `Audit public image privacy`，只读检查公开镜像所有标签的配置、来源证明及应用代码层。检查结果不打印命中的邮箱或凭据；它不下载或审查第三方运行时大层，也不能代替完整的人工安全审计。
 
 发布使用镜像内嵌缓存，不需要额外的缓存服务或缓存标签；请勿删除唯一的 `latest` 镜像缓存来源。需要刷新系统依赖时，在 Actions 手动运行发布流程并勾选 `refresh_dependencies`，该次会重新安装依赖，NAS 更新时也可能需要重新下载依赖层。升级 AI 基础环境时需审查并更新 Dockerfile 中的版本和摘要。构建上下文仅包含应用目录和构建说明，不上传录像、输出目录、模型、Mac 虚拟环境或根目录的凭据文件。缓存方案参考 [Docker 官方说明](https://docs.docker.com/build/ci/github-actions/cache/#inline-cache)。
 

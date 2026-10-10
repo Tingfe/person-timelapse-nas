@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "app"))
 from web_server import indexed_records  # noqa: E402
 
 input_root = Path(os.environ.get("INPUT_ROOT", "/Volumes/camera-recordings"))
-output_root = Path(os.environ.get("OUTPUT_ROOT", "/Volumes/camera-recordings/延时摄影"))
+output_root = Path(os.environ.get("OUTPUT_ROOT", str(input_root / "延时摄影")))
 
 if not input_root.is_dir():
     raise SystemExit(f"NAS 录像目录未挂载：{input_root}")

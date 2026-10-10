@@ -13,7 +13,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent.resolve()
-OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/Volumes/camera-recordings/延时摄影"))
+INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/Volumes/camera-recordings"))
+OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", str(INPUT_ROOT / "延时摄影")))
 PROGRESS_PATH = ROOT / ".mac-worker-state" / "progress.json"
 PROCESS = None
 PROCESS_KIND = None

@@ -28,7 +28,17 @@ jobs:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     steps:
+      - name: Mask personal email metadata before third-party actions
+        run: |
+          python3 - <<'PY'
+          import os, re
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+              event = source.read()
+          for email in set(re.findall(r"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}", event)):
+              print(f"::add-mask::{email}")
+          PY
       - uses: actions/checkout@v4
       - name: Run reliability regression tests
         run: python3 -m unittest discover -s tests -v

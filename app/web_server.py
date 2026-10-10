@@ -125,7 +125,8 @@ def recover_interrupted_tasks():
         if task.get("status") in {"running", "interrupted"}:
             task["status"] = "cancelled" if task.get("cancel_requested") else "paused" if task.get("pause_requested") else "queued"
             task.pop("finished_at", None)
-            task["detail"] = "服务重启，已从文件检查点恢复排队。"
+            task["detail"] = ("服务重启，将复用已校验的合成片段继续。" if task["kind"] == "export" else
+                              "服务重启，已从文件检查点恢复排队。")
             changed = True
     if changed:
         save_tasks(tasks)
@@ -232,6 +233,10 @@ def public_plans(document=None):
             status = "partial" if partial else "completed"
         elif document.get("paused") or "paused" in states or (export or {}).get("status") == "paused":
             status = "paused"
+        scan_units = units
+        export_progress = LIVE_PROGRESS.get((export or {}).get("id"), (export or {}).get("progress", {}))
+        export_percent = (100 if export and export["status"] in {"completed", "partial"} else
+                          max(0, min(100, export_progress.get("percent", 0))) if export else None)
         if export and export["status"] in {"completed", "partial"}:
             units += 1
         elif export and export["status"] == "running":
@@ -250,6 +255,8 @@ def public_plans(document=None):
         results.append({**plan, "camera": camera, "status": status, "phase": phase,
                         "completed_days": done, "total_days": len(plan["dates"]),
                         "partial_days": partial, "failed_days": failed, "percent": percent,
+                        "scan_percent": round(min(100, scan_units / max(len(plan["dates"]), 1) * 100), 1),
+                        "export_percent": export_percent,
                         "current_date": current["date"] if current else None, "outputs": outputs,
                         "detail": (export or {}).get("detail", ""),
                         "retry_ids": [identity for identity in [scan["id"] for scan in scans.values()] + ([export["id"]] if export else [])
@@ -303,6 +310,7 @@ def timelapses():
                       "status": metadata.get("status", "completed"),
                       "failed_files": len(metadata.get("failed_files", [])),
                       "scan_failed_files": metadata.get("scan_failed_files", 0),
+                      "duration_adjusted_files": metadata.get("duration_adjusted_files", 0),
                       "duration_seconds": round(metadata["frames"] / metadata["fps"], 2)
                       if metadata.get("frames") and metadata.get("fps", 0) > 0 else None,
                       "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")})
@@ -743,7 +751,7 @@ def task_worker(task, command, progress_file):
         "phase": "starting",
         "percent": 0,
         "elapsed_seconds": 0,
-        "current_file": "正在加载人物识别模型…",
+        "current_file": "正在检查可复用片段…" if task["kind"] == "export" else "正在加载人物识别模型…",
         "heartbeat_at": time.time(),
     }
     LIVE_PROGRESS[task_id] = initial
@@ -817,7 +825,8 @@ def task_worker(task, command, progress_file):
                 else:
                     task["finished_at"] = now_iso()
                 if task["status"] == "paused":
-                    detail = "已暂停；已完成文件的检查点已保留。"
+                    detail = ("已暂停；已校验的合成片段已保留，下次自动复用。" if task["kind"] == "export" else
+                              "已暂停；已完成文件的检查点已保留。")
                 elif task["status"] == "cancelled":
                     detail = "任务已取消；已完成的结果已保留。"
                 task["detail"] = detail
@@ -965,7 +974,8 @@ def retry_task(task_id):
         task = next((item for item in tasks["tasks"] if item["id"] == task_id), None)
         if not task or task["status"] in {"running", "queued"}:
             raise ValueError("该任务不需要重试")
-        task.update(status="queued", detail="已重新排队，将跳过已成功处理的文件。", retry_failed=True, timeout_retries=0)
+        task.update(status="queued", detail=("已重新排队，将复用完整片段，只重做未完成或失败素材。" if task["kind"] == "export" else
+                                             "已重新排队，将跳过已成功处理的文件。"), retry_failed=True, timeout_retries=0)
         for key in ("cancel_requested", "pause_requested", "finished_at", "not_before"):
             task.pop(key, None)
         save_tasks(tasks)

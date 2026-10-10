@@ -20,6 +20,7 @@ const timelapses = Array.from({length: 14}, (_, index) => ({
   camera: 'legacy', size_bytes: 12400000, duration_seconds: 40 + index,
   created_at: '2026-01-01T00:00:00Z', status: index === 0 ? 'partial' : 'completed',
   failed_files: index === 0 ? 1 : 0,
+  duration_adjusted_files: index === 1 ? 2 : 0,
 }));
 timelapses.unshift({name: 'people-timelapse-0-20231201-20250131.mp4', start_date: '20231201',
   end_date: '20250131', camera: '0', size_bytes: 64000000, duration_seconds: 240,
@@ -32,6 +33,7 @@ const tasks = Array.from({length: 10}, (_, index) => ({id: `scan-${index}`, kind
 const plans = Array.from({length: 4}, (_, index) => ({id: `plan-${index}`, kind: 'timelapse',
   start_date: '20240101', end_date: '20241231', camera: 'legacy', status: index === 0 ? 'running' : 'completed',
   phase: index === 0 ? 'scanning' : 'completed', percent: index === 0 ? 55 : 100,
+  scan_percent: index === 0 ? 55.6 : 100, export_percent: index === 0 ? 0 : 100,
   current_date: '20240229', completed_days: index === 0 ? 50 : 90, total_days: 90,
   partial_days: 1, failed_days: 0, retry_ids: [], outputs: index ? [timelapses[0].name] : [],
 }));
@@ -40,7 +42,8 @@ let model = {dates, timelapses, tasks, plans, queue_paused: false, queued_count:
 let created = [];
 
 (async () => {
-  const browser = await chromium.launch({headless: true});
+  const browser = await chromium.launch({headless: true,
+    ...(process.env.BROWSER_EXECUTABLE ? {executablePath: process.env.BROWSER_EXECUTABLE} : {})});
   try {
     const page = await browser.newPage({viewport: {width: 1440, height: 1100}});
     const errors = [];
@@ -133,20 +136,46 @@ let created = [];
     assert.equal(await page.locator('#playerVideo').evaluate(node => node.src), await page.evaluate(() => window.savedSrc));
     await page.click('#closePlayer');
 
+    model.tasks[0] = {...model.tasks[0], kind: 'export', camera: 'legacy', dates: ['20240101', '20241231'],
+      progress: {phase: 'exporting', percent: 12, current_file: 'generated-history.mp4',
+        file_index: 12, total_files: 100, frames: 250, estimated_frames: 2000, reused_files: 8,
+        frames_per_second: 1.2, estimated_output_seconds: 80, duration_adjusted_files: 3,
+        failed_files: 0, eta_seconds: 600, heartbeat_at: Date.now()/1000}};
+    model.plans[0] = {...model.plans[0], phase: 'exporting', percent: 98,
+      completed_days: 90, scan_percent: 100, export_percent: 12};
+    await page.evaluate(() => load(true));
+    await page.click('#planPager [data-page="0"]');
+    const firstPlan = page.locator('#plans .plan').first();
+    assert.match(await firstPlan.innerText(), /人物扫描 · 90\/90 天\s+100%/);
+    assert.match(await firstPlan.innerText(), /视频合成\s+12%/);
+    assert.doesNotMatch(await firstPlan.innerText(), /98%/);
+    assert.match(await page.locator('#missionTitle').innerText(), /2024.01.01 — 2024.12.31/);
+    assert.match(await page.locator('#missionText').innerText(), /复用 8 个片段 · 解码 1.2 帧\/秒/);
+    assert.match(await page.locator('#missionText').innerText(), /时长校正 3 个/);
+    model.tasks[0].progress.phase = 'encoding';
+    await page.evaluate(() => load(true));
+    assert.match(await page.locator('#missionTitle').innerText(), /正在拼接已保存片段/);
+    model.tasks[0].progress.phase = 'exporting';
+    await page.evaluate(() => load(true));
+
     const screenshotRoot = process.env.SCREENSHOT_DIR || os.tmpdir();
     await page.selectOption('#libraryYear', '');
     await page.selectOption('#libraryCamera', '');
     await page.fill('#librarySearch', '');
     await page.selectOption('#monthSelect', '');
-    await page.click('#planPager [data-page="0"]');
     await page.evaluate(() => window.scrollTo(0, 0));
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-desktop.png'), fullPage: true});
+    await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-progress.png')});
     await page.setViewportSize({width: 390, height: 844});
+    await page.reload();
+    await page.waitForSelector('.month');
+    assert.equal(await page.locator('header').count(), 1);
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
-    await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-mobile.png'), fullPage: true});
+    await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-mobile.png')});
     assert.deepEqual(errors, []);
-    console.log('PASS: annual/month calendar, leap year, range selection, task creation, pagination, cross-year filters, stable refresh, player isolation, desktop/mobile layout.');
+    assert.match(await page.locator('#timelapses').innerText(), /已按实际录像时长校正 2 个素材/);
+    console.log('PASS: calendar, range selection, pagination, filters, stable refresh, player isolation, separate stage progress, checkpoint details, desktop/mobile layout.');
   } finally {
     await browser.close();
   }

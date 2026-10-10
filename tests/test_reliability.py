@@ -214,6 +214,7 @@ class ReliabilityTests(unittest.TestCase):
         process = MagicMock()
         process.wait.return_value, process.poll.return_value = 1, 1
         with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 12), \
+                patch.object(P, "probe_video_duration", return_value=60), \
                 patch.object(P.subprocess, "Popen", return_value=process):
             with self.assertRaises(RuntimeError):
                 P.export([record], [(record["start"], record["end"])], self.output, "0", "20240101", 5, 25)
@@ -225,6 +226,7 @@ class ReliabilityTests(unittest.TestCase):
         encoder = MagicMock()
         encoder.wait.return_value, encoder.poll.return_value = 0, 0
         with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 30) as decode, \
+                patch.object(P, "probe_video_duration", return_value=60), \
                 patch.object(P.subprocess, "Popen", return_value=encoder), \
                 patch.object(P, "valid_video", return_value=True):
             P.export([record], [(record["start"], record["end"])], self.output, "0", "20240101", 1, 25)
@@ -237,6 +239,7 @@ class ReliabilityTests(unittest.TestCase):
         encoder = MagicMock()
         encoder.wait.return_value, encoder.poll.return_value = 0, 0
         with patch.object(P, "decode_export_frames", side_effect=[RuntimeError("timeout"), [b"jpeg"] * 30]), \
+                patch.object(P, "probe_video_duration", return_value=60), \
                 patch.object(P.subprocess, "Popen", return_value=encoder), \
                 patch.object(P, "valid_video", return_value=True):
             self.assertEqual(P.export([record], [(record["start"], record["end"])],

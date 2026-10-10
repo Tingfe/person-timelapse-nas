@@ -39,6 +39,8 @@ class RangePlanTests(unittest.TestCase):
         self.assertEqual(plan["completed_days"], 24)
         self.assertEqual(plan["total_days"], 25)
         self.assertEqual(plan["percent"], 94.2)
+        self.assertEqual(plan["scan_percent"], 98)
+        self.assertEqual(plan["export_percent"], 0)
         self.assertEqual(plan["current_date"], "20240125")
         self.assertEqual(plan["phase"], "scanning")
         self.assertEqual(plan["status"], "running")
@@ -51,6 +53,8 @@ class RangePlanTests(unittest.TestCase):
         plan = W.public_plans(document)[0]
         self.assertEqual(plan["phase"], "exporting")
         self.assertEqual(plan["percent"], 83.3)
+        self.assertEqual(plan["scan_percent"], 100)
+        self.assertEqual(plan["export_percent"], 50)
         W.OVERVIEW["timelapses"] = [
             {"name": "correct.mp4", "start_date": "20240101", "end_date": "20240102", "camera": "0"},
             {"name": "other-camera.mp4", "start_date": "20240101", "end_date": "20240102", "camera": "10"},
@@ -58,6 +62,7 @@ class RangePlanTests(unittest.TestCase):
         document["tasks"][-1]["status"] = "completed"
         plan = W.public_plans(document)[0]
         self.assertEqual(plan["percent"], 100)
+        self.assertEqual(plan["export_percent"], 100)
         self.assertEqual(plan["outputs"], ["correct.mp4"])
         self.assertEqual(plan["start_date"], "20231201")
 

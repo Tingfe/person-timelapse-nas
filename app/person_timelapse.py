@@ -15,6 +15,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -454,101 +455,272 @@ def decode_export_frames(path, offset, frame_seconds, frame_count, heartbeat, mo
     return frames
 
 
+def probe_video_duration(path):
+    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                             "stream=duration:format=duration", "-of", "json", str(path)],
+                            capture_output=True, text=True, timeout=15, check=True)
+    metadata = json.loads(result.stdout)
+    for entry in metadata.get("streams", []) + [metadata.get("format", {})]:
+        try:
+            duration = float(entry.get("duration", 0))
+            if math.isfinite(duration) and duration > 0:
+                return duration
+        except (TypeError, ValueError):
+            pass
+    raise RuntimeError("视频没有可读取的有效时长")
+
+
+def cache_json(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def export_intervals(record, events, duration=None):
+    limit = (record["end"] - record["start"]).total_seconds()
+    if duration is not None:
+        limit = min(limit, duration)
+    intervals = []
+    for start, end in sorted(events):
+        left = max(0.0, (start - record["start"]).total_seconds())
+        right = min(limit, (end - record["start"]).total_seconds())
+        if left >= right:
+            continue
+        if intervals and left <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(right, intervals[-1][1]))
+        else:
+            intervals.append((left, right))
+    return intervals
+
+
+def export_batches(record, intervals, frame_seconds, excluded):
+    for left, right in intervals:
+        while left < right:
+            count = max(1, min(30, math.ceil((right - left) / frame_seconds - 1e-9)))
+            moments = [record["start"] + timedelta(seconds=left + index * frame_seconds) for index in range(count)]
+            keep = [index for index, moment in enumerate(moments) if moment not in excluded]
+            if keep:
+                yield left, count, moments, keep
+            left += count * frame_seconds
+
+
+def wait_export_process(process, heartbeat):
+    started = time.monotonic()
+    timeout = float(os.environ.get("ENCODE_TIMEOUT_SECONDS", "300"))
+    while True:
+        if time.monotonic() - started >= timeout:
+            raise RuntimeError("视频编码或拼接超时")
+        try:
+            return process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            heartbeat()
+
+
 def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int,
            scan_failed_files=0):
     if not math.isfinite(frame_seconds) or frame_seconds <= 0 or fps <= 0:
         raise ValueError("抽帧间隔与输出帧率必须大于零")
-    output_root.mkdir(parents=True, exist_ok=True)
-    candidates = sorted((record for record in records if record["camera"] == camera), key=lambda record: record["start"])
     if not selected_events:
         raise SystemExit(f"camera {camera} has no events to export")
+    output_root.mkdir(parents=True, exist_ok=True)
+    cache_root = output_root / ".export-cache" / "v1"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    candidates = sorted({str(r["path"]): r for r in records if r["camera"] == camera}.values(),
+                        key=lambda r: (r["start"], str(r["path"])))
+    merged = []
+    for start, end in sorted(selected_events):
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    starts, ends = [a for a, _ in merged], [b for _, b in merged]
+    jobs = []
+    for record in candidates:
+        events = merged[bisect_right(ends, record["start"]):bisect_left(starts, record["end"])]
+        intervals = export_intervals(record, events)
+        if intervals:
+            jobs.append((record, events, intervals))
+    planned = [sum(max(1, math.ceil((b - a) / frame_seconds - 1e-9)) for a, b in intervals)
+               for _, _, intervals in jobs]
+    total_work, done_work = sum(planned), 0
     started = time.monotonic()
     target = output_root / f"people-timelapse-{camera}-{day}.mp4"
     descriptor, temporary = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".partial.mp4", dir=output_root)
     os.close(descriptor)
-    process = None
-    failed_files = set()
+    process, manifest = None, None
+    transient, fragments, failures, adjustments = [], [], {}, []
+    count = reused_frames = reused_files = file_count = 0
+    written_moments = set()
+
+    def heartbeat(phase="exporting"):
+        elapsed = max(time.monotonic() - started, .001)
+        fresh = count - reused_frames
+        rate = fresh / elapsed
+        eta = max(0, total_work - done_work - file_count) / rate if fresh >= 10 else None
+        report_progress(phase=phase, percent=95 if phase == "encoding" else
+                        round(min(90, (done_work + file_count) / max(total_work, 1) * 90), 1),
+                        current_file=record["path"].name if jobs else "没有可合成素材", file_index=index if jobs else 0,
+                        total_files=len(jobs), frames=count, estimated_frames=total_work,
+                        output_seconds=round(count / fps, 1), estimated_output_seconds=round(total_work / fps, 1),
+                        reused_files=reused_files, reused_frames=reused_frames, frames_per_second=round(rate, 2),
+                        failed_files=len(failures), duration_adjusted_files=len(adjustments),
+                        decode_mode=os.environ.get("EXPORT_DECODE_MODE", "keyframes"),
+                        elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta) if eta is not None and phase == "exporting" else None)
+
     try:
-        with tempfile.TemporaryFile() as errors:
-            process = subprocess.Popen([
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "image2pipe", "-vcodec", "mjpeg",
-                "-framerate", str(fps), "-i", "pipe:0", "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "26",
-                "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary,
-            ], stdin=subprocess.PIPE, stderr=errors)
-            count = 0
-            written_moments = set()
-            for record_index, record in enumerate(candidates, start=1):
-                # Only overlapping recordings can repeat a frame. Keeping the
-                # entire year's timestamps would grow memory with every frame.
-                written_moments = {moment for moment in written_moments if moment >= record["start"]}
-                relevant = [event for event in selected_events if overlaps(record["start"], record["end"], *event)]
-                if not relevant:
+        for index, (record, events, original_intervals) in enumerate(jobs, start=1):
+            file_count, file_moments = 0, set()
+            fragment_temp = None
+            written_moments = {moment for moment in written_moments if moment >= record["start"]}
+            heartbeat()
+            try:
+                stat = record["path"].stat()
+                source_stamp = {"source": source_id({**record, "size": stat.st_size}), "mtime_ns": stat.st_mtime_ns}
+                source_key = hashlib.sha256(json.dumps(source_stamp, sort_keys=True).encode()).hexdigest()
+                duration_path = cache_root / f"duration-{source_key}.json"
+                duration = cache_json(duration_path).get("duration")
+                if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
+                    duration = probe_video_duration(record["path"])
+                    atomic_json(duration_path, {"duration": duration})
+                intervals = export_intervals(record, events, duration)
+                trimmed = sum(b - a for a, b in original_intervals) - sum(b - a for a, b in intervals)
+                if trimmed > .001:
+                    adjustments.append({"file": record["path"].name, "actual_seconds": duration,
+                                        "trimmed_event_seconds": round(trimmed, 3)})
+                batches = list(export_batches(record, intervals, frame_seconds, written_moments))
+                expected = sum(len(batch[3]) for batch in batches)
+                total_work += expected - planned[index - 1]
+                planned[index - 1] = expected
+                if not expected:
                     continue
-
-                def heartbeat():
-                    report_progress(phase="exporting", percent=round((record_index - 1) / max(len(candidates), 1) * 90, 1),
-                                    current_file=record["path"].name, file_index=record_index, total_files=len(candidates),
-                                    frames=count, failed_files=len(failed_files),
-                                    decode_mode=os.environ.get("EXPORT_DECODE_MODE", "keyframes"),
-                                    elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=None)
-
-                heartbeat()
-                for event_start, event_end in sorted(relevant):
-                    start = max(record["start"], event_start)
-                    end = min(record["end"], event_end)
-                    offset = (start - record["start"]).total_seconds()
-                    stop = (end - record["start"]).total_seconds()
-                    while offset < stop:
-                        batch_count = max(1, min(30, math.ceil((stop - offset) / frame_seconds - 1e-9)))
-                        moments = [record["start"] + timedelta(seconds=offset + i * frame_seconds)
-                                   for i in range(batch_count)]
-                        if any(moment not in written_moments for moment in moments):
-                            try:
-                                frames = decode_export_frames(record["path"], offset, frame_seconds, batch_count, heartbeat)
-                            except (OSError, RuntimeError) as error:
-                                print(f"export read failed: {record['path'].name} @ {offset:g}s: {error}",
-                                      file=sys.stderr, flush=True)
-                                frames = []
-                            if len(frames) < batch_count:
-                                failed_files.add(record["path"].name)
-                            for moment, frame in zip(moments, frames):
-                                if moment not in written_moments:
-                                    process.stdin.write(frame)
-                                    written_moments.add(moment)
-                                    count += 1
-                        offset += batch_count * frame_seconds
+                recipe = {"source": source_stamp, "intervals": intervals, "frame_seconds": frame_seconds, "fps": fps,
+                          "mode": os.environ.get("EXPORT_DECODE_MODE", "keyframes"),
+                          "keep": [batch[3] for batch in batches], "offsets": [batch[0] for batch in batches],
+                          "video": "1280x720-x264-veryfast-crf26-v1"}
+                key = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+                fragment = cache_root / f"{key}.mp4"
+                metadata = cache_json(fragment.with_suffix(".json"))
+                if fragment.exists():
+                    cached_stat = fragment.stat()
+                    if (metadata.get("frames") == expected and metadata.get("validated")
+                            and cached_stat.st_size > 0
+                            and metadata.get("size_bytes") == cached_stat.st_size
+                            and metadata.get("mtime_ns") == cached_stat.st_mtime_ns):
+                        count += expected
+                        reused_frames += expected
+                        reused_files += 1
+                        written_moments.update(moment for _, _, moments, keep in batches for i, moment in enumerate(moments) if i in keep)
+                        fragments.append(fragment)
+                        done_work += expected
                         heartbeat()
-            if not count:
-                raise RuntimeError("所选事件未能读取任何画面，原有成片已保留")
-            process.stdin.close()
-            report_progress(phase="encoding", percent=95, frames=count, elapsed_seconds=round(time.monotonic() - started, 1))
-            if process.wait(timeout=float(os.environ.get("ENCODE_TIMEOUT_SECONDS", "300"))) != 0:
+                        continue
+                descriptor, fragment_temp = tempfile.mkstemp(prefix=f".{key}-", suffix=".partial.mp4", dir=cache_root)
+                os.close(descriptor)
+                with tempfile.TemporaryFile() as errors:
+                    process = subprocess.Popen([
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "image2pipe", "-vcodec", "mjpeg",
+                        "-framerate", str(fps), "-i", "pipe:0", "-vf",
+                        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                        "-c:v", "libx264", "-crf", "26", "-preset", "veryfast", "-threads", "2",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart", fragment_temp,
+                    ], stdin=subprocess.PIPE, stderr=errors)
+                    for offset, batch_count, moments, keep in batches:
+                        try:
+                            frames = decode_export_frames(record["path"], offset, frame_seconds, batch_count, heartbeat)
+                        except (OSError, RuntimeError) as error:
+                            failures[record["path"].name] = str(error)
+                            frames = []
+                        if any(i >= len(frames) for i in keep):
+                            failures.setdefault(record["path"].name, f"{offset:g} 秒处解码缺帧")
+                        for i in keep:
+                            if i < len(frames):
+                                process.stdin.write(frames[i])
+                                file_moments.add(moments[i])
+                                file_count += 1
+                                count += 1
+                        heartbeat()
+                    process.stdin.close()
+                    if not file_count or wait_export_process(process, heartbeat) != 0:
+                        errors.seek(0)
+                        raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-1000:] or "未能编码有效片段")
+                if not valid_video(fragment_temp):
+                    raise RuntimeError("片段校验失败")
+                after = record["path"].stat()
+                if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+                    raise RuntimeError("源文件处理期间发生变化，请稍后重试")
+                if record["path"].name not in failures:
+                    os.replace(fragment_temp, fragment)
+                    cached_stat = fragment.stat()
+                    atomic_json(fragment.with_suffix(".json"), {"frames": file_count, "validated": True,
+                                "size_bytes": cached_stat.st_size, "mtime_ns": cached_stat.st_mtime_ns})
+                    fragments.append(fragment)
+                else:
+                    fragments.append(Path(fragment_temp))
+                    transient.append(Path(fragment_temp))
+                written_moments.update(file_moments)
+                fragment_temp = None
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                failures[record["path"].name] = str(error)
+                count -= file_count
+                print(f"export failed: {record['path'].name}: {error}", file=sys.stderr, flush=True)
+            finally:
+                if process and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                if process and process.stdin and not process.stdin.closed:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                process = None
+                if fragment_temp:
+                    Path(fragment_temp).unlink(missing_ok=True)
+            done_work += planned[index - 1]
+            file_count = 0
+            heartbeat()
+        if not count:
+            raise RuntimeError("所选事件未能读取画面或已超出实际录像时长，原有成片已保留")
+        descriptor, manifest = tempfile.mkstemp(prefix=".export-concat-", suffix=".txt", dir=output_root)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            for fragment in fragments:
+                stream.write(f"file '{fragment.relative_to(output_root).as_posix()}'\n")
+        heartbeat("encoding")
+        with tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen(["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                                        "-f", "concat", "-safe", "0", "-i", manifest,
+                                        "-c", "copy", "-movflags", "+faststart", temporary], stderr=errors)
+            if wait_export_process(process, lambda: heartbeat("encoding")) != 0:
                 errors.seek(0)
-                raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-2000:])
-            if not valid_video(temporary):
-                raise RuntimeError("成片校验失败，原有视频已保留")
-            os.replace(temporary, target)
-            stat = target.stat()
-            atomic_json(target.with_suffix(".json"), {"status": "partial" if failed_files or scan_failed_files else "completed",
-                        "failed_files": sorted(failed_files), "scan_failed_files": scan_failed_files, "frames": count, "fps": fps,
-                        "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "validated": True,
-                        "decode_mode": os.environ.get("EXPORT_DECODE_MODE", "keyframes")})
+                raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-2000:] or "片段拼接失败")
+        if not valid_video(temporary):
+            raise RuntimeError("成片校验失败，原有视频已保留")
+        os.replace(temporary, target)
+        stat = target.stat()
+        atomic_json(target.with_suffix(".json"), {"status": "partial" if failures or scan_failed_files else "completed",
+                    "failed_files": sorted(failures), "failure_details": failures, "scan_failed_files": scan_failed_files,
+                    "frames": count, "fps": fps, "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "validated": True,
+                    "duration_adjustments": adjustments, "duration_adjusted_files": len(adjustments),
+                    "reused_files": reused_files, "decode_mode": os.environ.get("EXPORT_DECODE_MODE", "keyframes")})
     finally:
         if process and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
-        Path(temporary).unlink(missing_ok=True)
-    report_progress(
-        phase="partial" if failed_files or scan_failed_files else "completed", percent=100, file_index=len(candidates), total_files=len(candidates),
-        failed_files=len(failed_files),
-        frames=count, elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
-    )
-    if failed_files:
-        print(f"已生成可用成片，但 {len(failed_files)} 个源文件有读取失败，请检查后重试。", file=sys.stderr)
+        for path in [Path(temporary), *transient, *([Path(manifest)] if manifest else [])]:
+            path.unlink(missing_ok=True)
+    report_progress(phase="partial" if failures or scan_failed_files else "completed", percent=100,
+                    file_index=len(jobs), total_files=len(jobs), frames=count, failed_files=len(failures),
+                    reused_files=reused_files, reused_frames=reused_frames, duration_adjusted_files=len(adjustments),
+                    output_seconds=round(count / fps, 1), elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0)
+    if failures:
+        print(f"已生成可用成片，但 {len(failures)} 个源文件有读取失败；重试会复用完整片段。", file=sys.stderr)
     if scan_failed_files:
         print(f"前置人物扫描中有 {scan_failed_files} 个失败文件，成片并非完整扫描结果。", file=sys.stderr)
     print(target)
-    return 2 if failed_files or scan_failed_files else 0
+    return 2 if failures or scan_failed_files else 0
 
 
 def main():

@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
@@ -42,6 +43,11 @@ class MediaIntegrationTests(unittest.TestCase):
         target = self.output / "people-timelapse-0-20240101-20240102.mp4"
         self.assertTrue(P.valid_video(target))
         self.assertEqual(json.loads(target.with_suffix(".json").read_text())["frames"], 8)
+        stream = json.loads(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height,nb_frames,duration", "-of", "json", str(target)],
+                            capture_output=True, text=True, check=True).stdout)["streams"][0]
+        self.assertEqual((stream["width"], stream["height"], int(stream["nb_frames"])), (1280, 720, 8))
+        self.assertAlmostEqual(float(stream["duration"]), 2, places=2)
         with patch.object(W, "OUTPUT_ROOT", self.output):
             self.assertEqual(len(W.exports_for_date("20240102")), 1)
 
@@ -63,6 +69,57 @@ class MediaIntegrationTests(unittest.TestCase):
             exported = W.timelapses()[0]
             self.assertEqual(exported["status"], "partial")
             self.assertEqual(exported["scan_failed_files"], 1)
+
+    def test_real_interrupt_resume_and_cross_range_reuse(self):
+        events = [(r["start"], r["end"]) for r in self.records]
+        decoder = P.decode_export_frames
+
+        def interrupt_second(path, *args, **kwargs):
+            if path == self.records[1]["path"]:
+                raise KeyboardInterrupt()
+            return decoder(path, *args, **kwargs)
+
+        with patch.object(P, "decode_export_frames", side_effect=interrupt_second), self.assertRaises(KeyboardInterrupt):
+            P.export(self.records, events, self.output, "0", "20240101-20240102", 1, 4)
+        self.assertEqual(len(list((self.output / ".export-cache/v1").glob("*.mp4"))), 1)
+        with patch.object(P, "decode_export_frames", wraps=decoder) as decode:
+            self.assertEqual(P.export(self.records, events, self.output, "0", "20240101-20240102", 1, 4), 0)
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(decode.call_args.args[0], self.records[1]["path"])
+        metadata = json.loads((self.output / "people-timelapse-0-20240101-20240102.json").read_text())
+        self.assertEqual((metadata["frames"], metadata["reused_files"]), (8, 1))
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("should reuse real fragment")):
+            self.assertEqual(P.export(self.records[:1], events[:1], self.output, "0", "20240101", 1, 4), 0)
+        self.assertTrue(P.valid_video(self.output / "people-timelapse-0-20240101.mp4"))
+
+    def test_real_duration_shorter_than_filename_is_corrected_without_false_failure(self):
+        record = {**self.records[0], "end": self.records[0]["start"] + timedelta(seconds=10)}
+        self.assertEqual(P.export([record], [(record["start"], record["end"])],
+                                 self.output, "0", "20240101", 1, 4), 0)
+        metadata = json.loads((self.output / "people-timelapse-0-20240101.json").read_text())
+        self.assertEqual((metadata["frames"], metadata["status"], metadata["duration_adjusted_files"]),
+                         (4, "completed", 1))
+        self.assertAlmostEqual(metadata["duration_adjustments"][0]["trimmed_event_seconds"], 6, places=1)
+        with patch.object(W, "OUTPUT_ROOT", self.output):
+            self.assertEqual(W.timelapses()[0]["duration_adjusted_files"], 1)
+
+    def test_mixed_aspect_ratios_produce_consistent_reusable_fragments(self):
+        import cv2
+        import numpy as np
+        path = self.records[1]["path"]
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (96, 160))
+        self.assertTrue(writer.isOpened())
+        for _ in range(40):
+            writer.write(np.full((160, 96, 3), (20, 80, 160), dtype=np.uint8))
+        writer.release()
+        events = [(r["start"], r["end"]) for r in self.records]
+        self.assertEqual(P.export(self.records, events, self.output, "0", "20240101-20240102", 1, 4), 0)
+        target = self.output / "people-timelapse-0-20240101-20240102.mp4"
+        result = subprocess.run(["ffmpeg", "-v", "error", "-i", str(target), "-f", "null", "-"],
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(json.loads(target.with_suffix(".json").read_text())["frames"], 8)
 
     def test_hevc_keyframe_sampling_preserves_tail_and_accurate_mode(self):
         import cv2

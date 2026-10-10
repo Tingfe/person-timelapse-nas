@@ -145,6 +145,100 @@ def public_tasks():
     return result
 
 
+def public_plans(document=None):
+    """Aggregate existing task records in memory; never walk footage on polling."""
+    document = document if document is not None else load_tasks()
+    tasks = {task["id"]: task for task in document["tasks"] if task.get("id")}
+    plans = list(document.get("plans", []))
+    grouped_exports = {plan.get("export_id") for plan in plans}
+    # Older range exports already carry enough information to reconstruct a plan.
+    for task in tasks.values():
+        if task.get("kind") == "export" and task["id"] not in grouped_exports:
+            plans.append({"id": "legacy-" + task["id"], "kind": "timelapse",
+                          "start_date": task["date"], "end_date": max(task.get("dates") or [task["date"]]),
+                          "dates": task.get("dates") or [task["date"]], "camera": task.get("camera"),
+                          "created_at": task.get("created_at", ""), "scan_ids": task.get("depends_on", []),
+                          "export_id": task["id"]})
+    days = {day["date"]: day for day in OVERVIEW.get("dates", [])}
+    results = []
+    for plan in plans:
+        if not plan.get("dates"):
+            continue
+        export = tasks.get(plan.get("export_id"))
+        scan_ids = list(dict.fromkeys(plan.get("scan_ids", []) + (export or {}).get("depends_on", [])))
+        scans = {tasks[identity]["date"]: tasks[identity] for identity in scan_ids
+                 if identity in tasks and tasks[identity].get("kind") == "scan"}
+        done = partial = failed = 0
+        units = 0.0
+        states = []
+        ready_dates = set(plan.get("ready_dates", []))
+        for day in plan["dates"]:
+            scan = scans.get(day)
+            state = scan.get("status") if scan else "completed" if day in ready_dates else days.get(day, {}).get("scan_status", "pending")
+            states.append(state)
+            if state in {"completed", "partial"}:
+                done += 1
+                partial += state == "partial"
+                units += 1
+            elif state in {"failed", "cancelled", "interrupted", "blocked"}:
+                failed += 1
+            elif scan and state == "running":
+                progress = LIVE_PROGRESS.get(scan["id"], scan.get("progress", {}))
+                units += max(0, min(100, progress.get("percent", 0))) / 100
+        status = "queued"
+        phase = "scanning" if done < len(plan["dates"]) else "waiting_export" if export else "completed"
+        if export and export["status"] in {"completed", "partial", "failed", "cancelled", "blocked", "running"}:
+            status = export["status"]
+            if status == "running":
+                phase = "exporting"
+                units = len(plan["dates"])
+                done = len(plan["dates"])
+            elif status == "failed":
+                phase = "export_failed"
+            elif status in {"completed", "partial"}:
+                phase = "completed"
+                units = len(plan["dates"])
+                done = len(plan["dates"])
+        elif states and all(state == "cancelled" for state in states):
+            status = "cancelled"
+        elif failed:
+            status = "blocked"
+        elif "running" in states:
+            status = "running"
+        elif not export and done == len(plan["dates"]):
+            status = "partial" if partial else "completed"
+        elif document.get("paused") or "paused" in states or (export or {}).get("status") == "paused":
+            status = "paused"
+        if export and export["status"] in {"completed", "partial"}:
+            units += 1
+        elif export and export["status"] == "running":
+            progress = LIVE_PROGRESS.get(export["id"], export.get("progress", {}))
+            units += max(0, min(100, progress.get("percent", 0))) / 100
+        total = len(plan["dates"]) + bool(export)
+        percent = round(units / max(total, 1) * 100, 1)
+        if status not in {"completed", "partial"}:
+            percent = min(percent, 99.9)
+        first, last = min(plan["dates"]), max(plan["dates"])
+        camera = (export or {}).get("camera", plan.get("camera"))
+        outputs = [item["name"] for item in OVERVIEW.get("timelapses", [])
+                   if export and export["status"] in {"completed", "partial"}
+                   and item["start_date"] == first and item["end_date"] == last and item["camera"] == camera]
+        current = next((scan for scan in scans.values() if scan["status"] == "running"), None)
+        results.append({**plan, "camera": camera, "status": status, "phase": phase,
+                        "completed_days": done, "total_days": len(plan["dates"]),
+                        "partial_days": partial, "failed_days": failed, "percent": percent,
+                        "current_date": current["date"] if current else None, "outputs": outputs,
+                        "detail": (export or {}).get("detail", ""),
+                        "retry_ids": [identity for identity in [scan["id"] for scan in scans.values()] + ([export["id"]] if export else [])
+                                      if identity in tasks and tasks[identity]["status"] in
+                                      {"failed", "partial", "interrupted", "blocked", "paused", "cancelled"}]})
+    active = [plan for plan in results if plan["status"] not in {"completed", "partial", "cancelled"}]
+    active.sort(key=lambda plan: (plan["status"] == "running", plan.get("created_at", "")), reverse=True)
+    finished = sorted((plan for plan in results if plan not in active),
+                      key=lambda plan: plan.get("created_at", ""), reverse=True)
+    return active + finished[:12]
+
+
 def event_summary(date, total_files=0, processed_files=0, scan_status="pending", events=None):
     events = events if events is not None else read_json(OUTPUT_ROOT / f"events-{date}.json", {})
     groups = events.get("events", {})
@@ -186,6 +280,8 @@ def timelapses():
                       "status": metadata.get("status", "completed"),
                       "failed_files": len(metadata.get("failed_files", [])),
                       "scan_failed_files": metadata.get("scan_failed_files", 0),
+                      "duration_seconds": round(metadata["frames"] / metadata["fps"], 2)
+                      if metadata.get("frames") and metadata.get("fps", 0) > 0 else None,
                       "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")})
     return sorted(items, key=lambda item: item["created_at"], reverse=True)
 
@@ -409,7 +505,8 @@ def metadata_loop():
 
 def status_snapshot():
     tasks = public_tasks()
-    return {"tasks": tasks, "queue_paused": load_tasks().get("paused", False),
+    document = load_tasks()
+    return {"tasks": tasks, "plans": public_plans(document), "queue_paused": document.get("paused", False),
             "queued_count": sum(t["status"] == "queued" for t in tasks),
             "indexing": inventory_status()["indexing"]}
 
@@ -780,9 +877,17 @@ def create_task(payload):
             task["progress_file"] = f"progress-{task['id']}.json"
             tasks["tasks"].append(task)
             created.append(task)
+        plan_id = uuid.uuid4().hex[:8]
+        tasks.setdefault("plans", []).append({
+            "id": plan_id, "kind": kind, "start_date": date, "end_date": end_date,
+            "dates": dates, "camera": camera or None, "created_at": now_iso(),
+            "scan_ids": sorted(set(dependency_ids)),
+            "export_id": created[-1]["id"] if export_requested else None,
+            "ready_dates": [item["date"] for item in summaries if item["scan_status"] == "completed"],
+        })
         save_tasks(tasks)
     start_next_task()
-    return {"id": created[0]["id"], "created": len(created), "scan_created": scan_created,
+    return {"id": created[0]["id"], "plan_id": plan_id, "created": len(created), "scan_created": scan_created,
             "export_created": export_requested, "dates": dates, "camera": camera}
 
 
@@ -913,7 +1018,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return
         if path in {"/", "/index.html"}:
             self.path = "/web/index.html"
-        elif path in {"/web/index.html", "/web/login.html"}:
+        elif path in {"/web/index.html", "/web/login.html", "/web/app.js", "/web/style.css"}:
             self.path = path
         else:
             self.send_error(HTTPStatus.NOT_FOUND)

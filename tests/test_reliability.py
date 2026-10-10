@@ -160,6 +160,11 @@ class ReliabilityTests(unittest.TestCase):
                 response = client.getresponse()
                 self.assertEqual(response.status, 401)
                 response.read()
+                client.request("GET", "/web/app.js")
+                response = client.getresponse()
+                self.assertEqual(response.status, 303)
+                self.assertEqual(response.getheader("Location"), "/login")
+                response.read()
                 client.request("POST", "/api/login", json.dumps({"password": "测试 strong password"}).encode(),
                                {"Content-Type": "application/json"})
                 response = client.getresponse()
@@ -171,6 +176,13 @@ class ReliabilityTests(unittest.TestCase):
                     response = client.getresponse()
                     self.assertEqual(response.status, 200)
                     self.assertEqual(json.loads(response.read())["dates"][0]["date"], "20240101")
+                for asset, content_type in (("app.js", "javascript"), ("style.css", "text/css")):
+                    client.request("GET", "/web/" + asset, headers={"Cookie": cookie})
+                    response = client.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(content_type, response.getheader("Content-Type"))
+                    self.assertIn("no-store", response.getheader("Cache-Control"))
+                    self.assertTrue(response.read())
                 (self.output / ".access-password").write_text("secret")
                 for path in ("/media/.access-password", "/web/../person_timelapse.py"):
                     client.request("GET", path, headers={"Cookie": cookie})

@@ -97,7 +97,7 @@ class ScanStatusTests(unittest.TestCase):
             WEB.OUTPUT_ROOT = output
             video = output / "people-timelapse-0-20260301-20260303.mp4"
             video.write_bytes(b"video")
-            (video.with_suffix(".json")).write_text(json.dumps({"validated": True,
+            (video.with_suffix(".json")).write_text(json.dumps({"validated": True, "frames": 250, "fps": 25,
                 "size_bytes": video.stat().st_size, "mtime_ns": video.stat().st_mtime_ns}), encoding="utf-8")
             records = [
                 {"camera": "0", "start": datetime(2026, 3, day, 1), "end": datetime(2026, 3, day, 2),
@@ -105,6 +105,7 @@ class ScanStatusTests(unittest.TestCase):
                 for day in (1, 2, 3, 4)
             ]
             try:
+                self.assertEqual(WEB.timelapses()[0]["duration_seconds"], 10)
                 self.assertEqual([item["name"] for item in WEB.exports_for_date("20260302")],
                                  ["people-timelapse-0-20260301-20260303.mp4"])
                 summaries = {item["date"]: item for item in WEB.available_dates({"records": records})}

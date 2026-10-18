@@ -45,6 +45,10 @@ function renderMission(){
   $('#missionPercent').textContent=run?`${p.percent??0}%`:'—';
   $('#missionText').textContent=run?`${p.current_file||'正在准备文件…'}\n文件 ${p.file_index||0}/${p.total_files||'?'} · ${run.kind==='export'?'已输出 '+(p.frames||0)+' 帧':'抽帧 '+(p.samples||0)+'/'+(p.estimated_samples||'?')+' · YOLO '+(p.yolo_inferences||0)+' 次'} · 预计剩余 ${time(p.eta_seconds)}`:overview.indexing?(d.message||'后台正在检查录像日期，已有结果仍可查看。'):d.available?`已发现 ${d.mp4_files||0} 个 MP4，${d.recognized_files||0} 个文件名可识别。\n在下方选择日期范围；运行任务与成片会分别显示。`:(d.message||'等待录像索引；请确认源目录已挂载。');
   if(run?.kind==='export')$('#missionText').textContent+=`\n复用 ${p.reused_files||0} 个片段 · 解码 ${p.frames_per_second??'—'} 帧/秒 · 预计成片 ${time(p.estimated_output_seconds)}\n读取异常 ${p.failed_files||0} 个 · 时长校正 ${p.duration_adjusted_files||0} 个 · ${p.heartbeat_at?'最近更新 '+time(Math.max(0,Date.now()/1000-p.heartbeat_at))+'前':'正在准备检查点'}`;
+  if(run?.kind==='scan'&&p.step){
+    const step={model:'加载识别模型',preparing:'准备文件',metadata:'读取真实时长',decoding:'抽取画面',motion:'检查画面变化',inference:'识别人像',saving:'保存缩略图',checkpoint:'保存文件检查点'}[p.step]||p.step;
+    $('#missionText').textContent+=`\n${step} · 本步 ${time(p.step_elapsed_seconds)} · ${p.decode_mode==='keyframes'?'关键帧快速抽样':'精确抽帧'}\n累计解码 ${time(p.decode_seconds)} · 识别 ${time(p.inference_seconds)} · 时长校正 ${p.duration_adjusted_files||0} 个 · 失败 ${p.failed_files||0} 个`;
+  }
   $('#elapsed').textContent=run?`${time(elapsed(run,p))} 已运行`:overview.queue_paused?'PAUSED':overview.indexing?'INDEXING':'READY';
 }
 function renderPlans(){

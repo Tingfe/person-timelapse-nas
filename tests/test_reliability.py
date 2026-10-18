@@ -1,4 +1,5 @@
 import importlib
+from contextlib import contextmanager
 from http.client import HTTPConnection
 import json
 import os
@@ -41,22 +42,25 @@ class ReliabilityTests(unittest.TestCase):
                               TASKS_PATH=self.output / "tasks.json", INVENTORY_DB_PATH=self.output / "inventory.sqlite3",
                               STATE_READY=False, LIVE_PROGRESS={})
 
+    @contextmanager
     def fake_video_modules(self, readable=True, present=False, interrupt_second=False):
         calls = []
 
-        def capture(path):
+        def duration(path, **kwargs):
             calls.append(path)
             if interrupt_second and len(calls) == 2:
                 raise KeyboardInterrupt()
-            return SimpleNamespace(isOpened=lambda: readable,
-                                   get=lambda prop: 1 if prop == 1 else 60,
-                                   set=lambda *args: True, read=lambda: (True, object()), release=lambda: None)
+            if not readable:
+                raise RuntimeError("视频无法打开")
+            return 60
 
-        cv = SimpleNamespace(VideoCapture=capture, CAP_PROP_FPS=1, CAP_PROP_FRAME_COUNT=2,
-                             CAP_PROP_POS_MSEC=3, COLOR_BGR2GRAY=4, cvtColor=lambda *args: object(),
+        cv = SimpleNamespace(COLOR_BGR2GRAY=4, cvtColor=lambda *args: object(),
                              resize=lambda *args: object(), mean=lambda *args: [0], absdiff=lambda *args: object())
         yolo = SimpleNamespace(YOLO=lambda _: lambda *args, **kwargs: [SimpleNamespace(boxes=[1] if present else [])])
-        return patch.dict(sys.modules, {"cv2": cv, "ultralytics": yolo})
+        with patch.dict(sys.modules, {"cv2": cv, "ultralytics": yolo}), \
+                patch.object(P, "probe_video_duration", side_effect=duration), \
+                patch.object(P, "decode_scan_frame", side_effect=lambda path, offset, *args: (object(), offset)):
+            yield
 
     def scan_main(self, *extra):
         argv = ["person_timelapse.py", "scan", str(self.source), str(self.output),

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "app"))
 P = importlib.import_module("person_timelapse")
@@ -135,6 +136,36 @@ class MediaIntegrationTests(unittest.TestCase):
                             for frame in frames))
         exact = P.decode_export_frames(file, 1.1, .5, 3, lambda: None, mode="accurate")
         self.assertEqual(len(exact), 3)
+
+    def test_scan_hevc_seek_preserves_actual_pts_and_reads_tail(self):
+        file = self.root / "scan-hevc.mp4"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=960x540:rate=10:duration=8", "-c:v", "libx265", "-preset", "ultrafast",
+                        "-x265-params", "keyint=20:min-keyint=20:scenecut=0:pools=1:frame-threads=1:log-level=error",
+                        str(file)], check=True, capture_output=True, timeout=30)
+        image, actual = P.decode_scan_frame(file, 1.1, 8, 256, lambda: None, "keyframes")
+        self.assertLessEqual(max(image.shape[:2]), 640)
+        self.assertAlmostEqual(actual, 2, places=2)
+        _, tail = P.decode_scan_frame(file, 7.1, 8, 256, lambda: None, "keyframes")
+        self.assertAlmostEqual(tail, 7.1, places=2)
+        _, exact = P.decode_scan_frame(file, 1.1, 8, 256, lambda: None, "accurate")
+        self.assertAlmostEqual(exact, 1.1, places=2)
+
+    def test_real_scan_checks_actual_duration_and_reuses_completed_file(self):
+        record = {**self.records[0], "end": self.records[0]["start"] + timedelta(seconds=10)}
+        yolo = SimpleNamespace(YOLO=lambda _: lambda *args, **kwargs: [SimpleNamespace(boxes=[1])])
+        def checkpoint(record, settings, events, error):
+            P.commit_result(self.output, record, settings, events, error)
+        with patch.dict(sys.modules, {"ultralytics": yolo}):
+            P.scan([record], self.output, 2, .45, 0, checkpoint=checkpoint)
+        saved = list(P.scan_results(self.output))[0]
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(sum(event["hits"] for event in saved["events"]["0"]), 2)
+        self.assertTrue(all(event["end"] <= (record["start"] + timedelta(seconds=4)).isoformat(timespec="seconds")
+                            for event in saved["events"]["0"]))
+        with patch.dict(sys.modules, {"ultralytics": yolo}), \
+                patch.object(P, "decode_scan_frame", side_effect=AssertionError("completed file must not be decoded")):
+            P.scan([record], self.output, 2, .45, 0, checkpoint=checkpoint)
 
 
 if __name__ == "__main__":

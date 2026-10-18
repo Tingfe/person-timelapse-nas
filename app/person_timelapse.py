@@ -134,7 +134,15 @@ def save_ledger(output_root: Path, ledger):
 
 def scan_settings(sample_seconds, confidence, merge_seconds, motion_threshold, keepalive_seconds, imgsz):
     return {"sample_seconds": sample_seconds, "confidence": confidence, "merge_seconds": merge_seconds,
-            "motion_threshold": motion_threshold, "keepalive_seconds": keepalive_seconds, "imgsz": imgsz}
+            "motion_threshold": motion_threshold, "keepalive_seconds": keepalive_seconds, "imgsz": imgsz,
+            "decode_mode": scan_decode_mode(sample_seconds)}
+
+
+def scan_decode_mode(sample_seconds):
+    mode = os.environ.get("SCAN_DECODE_MODE", "auto")
+    if mode not in {"auto", "keyframes", "accurate"}:
+        raise ValueError("SCAN_DECODE_MODE must be auto, keyframes or accurate")
+    return ("keyframes" if sample_seconds >= 10 else "accurate") if mode == "auto" else mode
 
 
 def settings_satisfied(entry, requested):
@@ -145,6 +153,8 @@ def settings_satisfied(entry, requested):
     return (previous["sample_seconds"] <= requested["sample_seconds"]
             and previous["imgsz"] >= requested["imgsz"]
             and previous["confidence"] == requested["confidence"]
+            and (requested.get("decode_mode", "accurate") != "accurate"
+                 or previous.get("decode_mode", "accurate") == "accurate")
             and (old_motion is None or (new_motion is not None and old_motion <= new_motion)))
 
 
@@ -264,36 +274,122 @@ def save_thumbnail(frame, output_root: Path, camera: str, moment: datetime):
     return target
 
 
+def scan_media_process(command, heartbeat, timeout, allow_empty=False):
+    """A bounded media read; cancellation always reaps its decoder child."""
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise RuntimeError(f"视频读取超时（{timeout:g} 秒）")
+                try:
+                    data, _ = process.communicate(timeout=min(2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    heartbeat()
+            errors.seek(0)
+            detail = errors.read().decode("utf-8", errors="replace")
+            if process.returncode and (data or not allow_empty):
+                raise RuntimeError(f"视频读取失败（FFmpeg 退出码 {process.returncode}）")
+            return data, detail
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+            process.stdout.close()
+
+
+def decode_scan_frame(path, offset, duration, imgsz, heartbeat, mode):
+    """Seek at the demuxer, decode one picture, and retain its actual PTS.
+
+    Sparse scans skip inter frames *in the decoder*, not after full-resolution
+    decoding. Do not use an fps filter: it can silently duplicate keyframes and
+    assign them a different timestamp. A missing final keyframe gets one exact
+    tail read, never a full-file retry.
+    """
+    import cv2
+    import numpy as np
+
+    timeout = float(os.environ.get("SCAN_DECODE_TIMEOUT_SECONDS", "90"))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("SCAN_DECODE_TIMEOUT_SECONDS must be finite and positive")
+    edge = max(640, imgsz)
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-threads", "1"]
+    if mode == "keyframes":
+        command += ["-skip_frame", "nokey"]
+    command += ["-ss", str(offset), "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+                "-t", str(duration - offset), "-vf",
+                f"scale='min({edge},iw)':'min({edge},ih)':force_original_aspect_ratio=decrease,showinfo=checksum=0",
+                "-frames:v", "1", "-threads", "1", "-c:v", "mjpeg", "-q:v", "3", "-f", "image2pipe", "pipe:1"]
+    # Some FFmpeg versions fail encoder initialization when no keyframe remains.
+    # Only empty keyframe output may fall back; never accept a nonzero exit with
+    # partially written image data as a successful sample.
+    data, detail = scan_media_process(command, heartbeat, timeout, allow_empty=mode == "keyframes")
+    timestamps = re.findall(r"\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:\s*([-+\d.eE]+)", detail)
+    actual = offset + float(timestamps[0]) if timestamps else float("nan")
+    if mode == "keyframes" and (not data or (math.isfinite(actual) and actual >= duration)):
+        return decode_scan_frame(path, offset, duration, imgsz, heartbeat, "accurate")
+    if not data or not math.isfinite(actual) or actual < 0 or actual >= duration:
+        raise RuntimeError("无法读取有效采样画面或画面时间戳")
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError("采样画面解码失败")
+    return frame, actual
+
+
 def scan(records, output_root: Path, sample_seconds: float, confidence: float, merge_seconds: float,
          motion_threshold: Optional[float] = None, keepalive_seconds: float = 60.0, imgsz: int = 640,
          device: Optional[str] = None, checkpoint=None, force=False, run_id=None):
     import cv2
     from ultralytics import YOLO
 
-    model = YOLO(os.environ.get("MODEL_PATH", "/models/yolo11n.pt"))
+    if not math.isfinite(sample_seconds) or sample_seconds <= 0 or imgsz <= 0:
+        raise ValueError("采样间隔与识别尺寸必须大于零")
     events = defaultdict(list)
     samples = 0
     inferences = 0
-    estimated_samples = max(1, sum(
-        math.ceil((record["end"] - record["start"]).total_seconds() / sample_seconds) for record in records
-    ))
+    planned = [math.ceil((record["end"] - record["start"]).total_seconds() / sample_seconds) for record in records]
+    work_done, file_samples, completed_files, failed_files, duration_adjusted_files = 0, 0, 0, 0, 0
     started = time.monotonic()
     settings = scan_settings(sample_seconds, confidence, merge_seconds, motion_threshold, keepalive_seconds, imgsz)
+    step, step_started, timings = "model", started, defaultdict(float)
+
+    def set_step(value):
+        nonlocal step, step_started
+        now = time.monotonic()
+        timings[step] += now - step_started
+        step, step_started = value, now
+
+    def timing(value):
+        return round(timings[value] + (time.monotonic() - step_started if step == value else 0), 1)
 
     def update(index, record, offset):
         elapsed = max(time.monotonic() - started, 0.001)
-        percent = min(99.9, samples / estimated_samples * 100)
-        eta = (elapsed / samples * max(estimated_samples - samples, 0)) if samples else None
+        estimated_samples = max(1, sum(planned))
+        processed = work_done + file_samples
+        percent = min(99.9, processed / estimated_samples * 100)
+        eta = elapsed / processed * max(estimated_samples - processed, 0) if processed >= 2 else None
         report_progress(
             phase="scanning", percent=round(percent, 1), current_file=record["path"].name,
             file_index=index, total_files=len(records), offset_seconds=round(offset, 1),
             samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
+            step=step, step_elapsed_seconds=round(time.monotonic() - step_started, 1),
+            decode_mode=settings["decode_mode"], decode_seconds=timing("decoding"),
+            inference_seconds=timing("inference"), metadata_seconds=timing("metadata"),
+            completed_files=completed_files, failed_files=failed_files, duration_adjusted_files=duration_adjusted_files,
             elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta, 1) if eta is not None else None,
             source={"source_id": source_id(record), "path": str(record["path"]), "camera": record["camera"],
                     "start": record["start"].isoformat(), "end": record["end"].isoformat(), "settings": settings},
         )
 
+    if records:
+        update(1, records[0], 0)
+    model = YOLO(os.environ.get("MODEL_PATH", "/models/yolo11n.pt"))
     for index, record in enumerate(records, start=1):
+        file_samples = 0
+        set_step("preparing")
         print(f"[{index}/{len(records)}] {record['path'].name}", flush=True)
         update(index, record, 0)
         try:
@@ -304,40 +400,46 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
                     entry = json.loads(saved.read_text(encoding="utf-8"))
                     if (entry["status"] == "completed" and settings_satisfied(entry, settings)
                             and (not force or (run_id and entry.get("run_id") == run_id))):
+                        work_done += planned[index - 1]
+                        completed_files += 1
                         continue
-                capture, file_events, error, offset = None, defaultdict(list), None, 0.0
+                file_events, error, offset = defaultdict(list), None, 0.0
                 try:
-                    capture = cv2.VideoCapture(str(record["path"]))
-                    if not capture.isOpened():
-                        raise RuntimeError("视频无法打开")
-                    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
-                    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-                    duration = min(frame_count / fps, (record["end"] - record["start"]).total_seconds())
+                    set_step("metadata")
+                    update(index, record, offset)
+                    nominal_duration = (record["end"] - record["start"]).total_seconds()
+                    duration = min(probe_video_duration(record["path"], heartbeat=lambda: update(index, record, 0)),
+                                   nominal_duration)
                     if not math.isfinite(duration) or duration <= 0:
                         raise RuntimeError("视频没有有效时长")
-                    offset, decoded, failed_reads = 0.0, 0, 0
-                    previous_gray, last_person = None, datetime.min
+                    planned[index - 1] = math.ceil(duration / sample_seconds)
+                    duration_adjusted_files += int(nominal_duration - duration > 1)
+                    previous_gray, last_person, last_sample = None, datetime.min, -1.0
                     while offset < duration:
+                        set_step("decoding")
                         update(index, record, offset)
-                        capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000)
-                        ok, frame = capture.read()
-                        if not ok:
-                            failed_reads += 1
-                            offset += sample_seconds
-                            continue
-                        decoded += 1
+                        frame, actual = decode_scan_frame(record["path"], offset, duration, imgsz,
+                                                         lambda: update(index, record, offset), settings["decode_mode"])
+                        set_step("motion")
+                        file_samples += 1
                         samples += 1
-                        moment = record["start"] + timedelta(seconds=offset)
+                        offset = file_samples * sample_seconds
+                        if actual <= last_sample:
+                            continue  # Long GOPs can map adjacent requests to the same picture.
+                        last_sample = actual
+                        moment = record["start"] + timedelta(seconds=actual)
                         current_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
                         motion = (previous_gray is None or motion_threshold is None
                                   or cv2.mean(cv2.absdiff(current_gray, previous_gray))[0] >= motion_threshold)
                         previous_gray = current_gray
                         recently_seen = (moment - last_person).total_seconds() <= keepalive_seconds
                         if motion_threshold is not None and not motion and not recently_seen:
-                            offset += sample_seconds
                             continue
+                        set_step("inference")
+                        update(index, record, actual)
                         inferences += 1
                         result = model(frame, classes=[0], conf=confidence, imgsz=imgsz, verbose=False, device=device)[0]
+                        set_step("saving")
                         if len(result.boxes):
                             last_person = moment
                             thumbnail = save_thumbnail(frame, output_root, record["camera"], moment)
@@ -348,27 +450,33 @@ def scan(records, output_root: Path, sample_seconds: float, confidence: float, m
                                 "end": min(record["start"] + timedelta(seconds=duration), moment + padding).isoformat(timespec="seconds"),
                                 "hits": 1, "thumbnail": str(thumbnail.relative_to(output_root)),
                             })
-                        offset += sample_seconds
-                    if not decoded or failed_reads:
-                        raise RuntimeError(f"解码不完整：成功 {decoded} 次，失败 {failed_reads} 次")
                 except Exception as exception:
                     error = str(exception)
                     print(f"scan failed: {record['path'].name}: {error}", file=sys.stderr, flush=True)
-                finally:
-                    if capture is not None:
-                        capture.release()
+                set_step("checkpoint")
+                update(index, record, offset)
                 if checkpoint:
                     checkpoint(record, settings, merge_events(file_events, merge_seconds), error)
+                work_done += planned[index - 1]
+                file_samples = 0
+                completed_files += int(not error)
+                failed_files += int(bool(error))
                 if not error:
                     for camera, found in file_events.items():
                         events[camera].extend(found)
                 update(index, record, offset)
+                print(f"file {'failed' if error else 'completed'}; decode={timing('decoding')}s "
+                      f"inference={timing('inference')}s samples={samples}", flush=True)
         except TimeoutError:
+            work_done += planned[index - 1]
             print(f"另一个节点正在扫描，稍后重试：{record['path'].name}", flush=True)
     print(f"samples={samples} yolo_inferences={inferences}", flush=True)
     report_progress(
         phase="completed", percent=100, file_index=len(records), total_files=len(records),
-        samples=samples, estimated_samples=estimated_samples, yolo_inferences=inferences,
+        samples=samples, estimated_samples=max(1, sum(planned)), yolo_inferences=inferences,
+        decode_mode=settings["decode_mode"], decode_seconds=timing("decoding"), inference_seconds=timing("inference"),
+        metadata_seconds=timing("metadata"), completed_files=completed_files, failed_files=failed_files,
+        duration_adjusted_files=duration_adjusted_files,
         elapsed_seconds=round(time.monotonic() - started, 1), eta_seconds=0,
     )
     return merge_events(events, merge_seconds)
@@ -455,11 +563,14 @@ def decode_export_frames(path, offset, frame_seconds, frame_count, heartbeat, mo
     return frames
 
 
-def probe_video_duration(path):
-    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                             "stream=duration:format=duration", "-of", "json", str(path)],
-                            capture_output=True, text=True, timeout=15, check=True)
-    metadata = json.loads(result.stdout)
+def probe_video_duration(path, heartbeat=None):
+    command = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=duration:format=duration", "-of", "json", str(path)]
+    if heartbeat is None:
+        data = subprocess.run(command, capture_output=True, text=True, timeout=15, check=True).stdout
+    else:
+        data, _ = scan_media_process(command, heartbeat, 45)
+    metadata = json.loads(data)
     for entry in metadata.get("streams", []) + [metadata.get("format", {})]:
         try:
             duration = float(entry.get("duration", 0))
@@ -795,8 +906,10 @@ def main():
         incomplete = {source_id(record) for record in records if needs_scan(record)}
         failures = {r["source_id"] for r in scan_results(args.output, args.date) if r["status"] == "failed"}
         deferred = bool(incomplete - failures) and not args.limit
-        report_progress(phase="waiting" if deferred else "partial" if incomplete else "completed",
-                        percent=0 if deferred else 100, failed_files=len(incomplete & failures), pending_files=len(incomplete))
+        progress = cache_json(Path(os.environ["PROGRESS_PATH"])) if os.environ.get("PROGRESS_PATH") else {}
+        report_progress(**{**progress, "phase": "waiting" if deferred else "partial" if incomplete else "completed",
+                           "percent": 0 if deferred else 100, "failed_files": len(incomplete & failures),
+                           "pending_files": len(incomplete)})
         print(args.output / f"events-{args.date}.json")
         if deferred:
             print("部分源文件正在由其他节点处理，稍后自动续排。", flush=True)

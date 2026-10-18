@@ -17,6 +17,16 @@ P = importlib.import_module("person_timelapse")
 
 
 class ScanDecoderTests(unittest.TestCase):
+    def test_mac_missing_codec_tools_exits_before_claiming_priority_or_writing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "PATH": "", "INPUT_ROOT": directory, "OUTPUT_ROOT": directory,
+                           "PROGRESS_PATH": str(Path(directory) / "progress.json")}
+            result = subprocess.run(["/bin/sh", str(Path(__file__).parents[1] / "mac-worker.sh"), "20000101"],
+                                    env=environment, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ffprobe", result.stdout)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     @contextmanager
     def image_runtime(self):
         frame = object()

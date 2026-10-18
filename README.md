@@ -129,6 +129,8 @@ image: tingfe/person-timelapse-nas:sha-提交哈希
 
 Apple Silicon Mac 可用 Metal/MPS 参与计算。将 NAS 的录像目录与 `延时摄影` 输出目录通过 SMB 挂载到 Mac 后，在本仓库运行：
 
+Mac 扫描需要已有 `uv`、`ffmpeg` 和 `ffprobe`，其中后两项通常由同一个 FFmpeg 安装提供。脚本不会自动安装全局软件；缺少解码工具时会先退出并提示，不领取计算优先权，也不把录像写成失败。安装或调整 PATH 后请重新启动控制台。
+
 ```sh
 export INPUT_ROOT="/Volumes/camera-recordings"
 export OUTPUT_ROOT="$INPUT_ROOT/延时摄影"

@@ -15,6 +15,11 @@ INVENTORY_DB_PATH="$OUTPUT_ROOT/inventory.sqlite3"
 
 [ -d "$INPUT_ROOT" ] || { echo "NAS 录像目录未挂载：$INPUT_ROOT"; exit 1; }
 [ -d "$OUTPUT_ROOT" ] || { echo "NAS 输出目录不可用：$OUTPUT_ROOT"; exit 1; }
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  echo "人物扫描需要 ffmpeg 和 ffprobe。请先安装并确认在 PATH 中，再重新启动控制台。"
+  echo "不会自动安装全局软件，也不会将录像误标为处理失败。"
+  exit 1
+fi
 mkdir -p "$(dirname "$PROGRESS_PATH")"
 rm -f "$PROGRESS_PATH"
 

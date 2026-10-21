@@ -686,16 +686,19 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     transient, fragments, failures, adjustments = [], [], {}, []
     count = reused_frames = reused_files = file_count = 0
     written_moments = set()
-    mux = {"frames": 0, "seconds": 0.0, "bytes": 0}
+    mux = {"frames": None, "seconds": 0.0, "bytes": 0}
 
     def heartbeat(phase="exporting"):
         elapsed = max(time.monotonic() - started, .001)
         fresh = count - reused_frames
         rate = fresh / elapsed
         eta = max(0, total_work - done_work - file_count) / rate if fresh >= 10 else None
-        mux_fraction = min(1, mux["frames"] / max(count, 1))
+        mux_fraction = min(1, mux["frames"] / max(count, 1) if mux["frames"] is not None else
+                           mux["seconds"] / max(count / fps, .001))
+        mux_position = (f"{mux['frames']}/{count} 帧" if mux["frames"] is not None else
+                        f"媒体时间 {mux['seconds']:.1f}/{count / fps:.1f} 秒")
         current_file = (f"{'正在完成 MP4 封装' if mux_fraction == 1 else '最终拼接'} · "
-                        f"{mux['frames']}/{count} 帧 · 文件 {mux['bytes'] / 1048576:.1f} MB") if phase == "encoding" else (
+                        f"{mux_position} · 文件 {mux['bytes'] / 1048576:.1f} MB") if phase == "encoding" else (
                             record["path"].name if jobs else "没有可合成素材")
         report_progress(phase=phase, percent=round(90 + mux_fraction * 9, 1) if phase == "encoding" else
                         round(min(90, (done_work + file_count) / max(total_work, 1) * 90), 1),
@@ -838,7 +841,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
                     if separator and field:
                         try:
                             number = int(value)
-                            mux[field] = max(mux[field], number / 1000000 if field == "seconds" else number)
+                            mux[field] = max(mux[field] or 0, number / 1000000 if field == "seconds" else number)
                         except ValueError:
                             pass
                 stat = Path(temporary).stat()

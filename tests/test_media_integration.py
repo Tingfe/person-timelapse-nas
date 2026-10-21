@@ -43,7 +43,10 @@ class MediaIntegrationTests(unittest.TestCase):
         with patch.object(P, "report_progress") as progress:
             self.assertEqual(P.export(list(reversed(self.records)) * 2, events, self.output, "0", "20240101-20240102", 1, 4), 0)
         muxed = [call.kwargs for call in progress.call_args_list if call.kwargs.get("phase") == "encoding"]
-        self.assertTrue(any(item.get("mux_frames") == 8 and item.get("mux_bytes", 0) > 0 for item in muxed))
+        # FFmpeg 6.1 omits frame statistics during streamcopy. Its media clock
+        # must still advance; ffprobe below verifies the actual final 8 frames.
+        self.assertTrue(any(item.get("mux_seconds", 0) > 0 and item.get("mux_bytes", 0) > 0 for item in muxed), muxed)
+        self.assertTrue(all(item.get("mux_frames") is None or 0 <= item["mux_frames"] <= 8 for item in muxed), muxed)
         self.assertTrue(all(90 <= item["percent"] <= 99 for item in muxed))
         target = self.output / "people-timelapse-0-20240101-20240102.mp4"
         self.assertTrue(P.valid_video(target))

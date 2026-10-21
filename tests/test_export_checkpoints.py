@@ -200,6 +200,24 @@ class ExportCheckpointTests(unittest.TestCase):
         self.assertEqual(len(list((self.output / ".export-cache/v1").glob("*.mp4"))), 2)
         self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
 
+    def test_concat_without_frame_statistics_uses_media_time_and_ignores_partial_line(self):
+        def encoder_without_frame_stats(command, **kwargs):
+            process = self.fake_encoder(command, **kwargs)
+            if "concat" in command:
+                kwargs["stdout"].write(b"out_time_us=240000\nprogress=end\nframe=999")
+                kwargs["stdout"].flush()
+            return process
+
+        with patch.object(P.subprocess, "Popen", side_effect=encoder_without_frame_stats), \
+                patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.object(P, "report_progress") as progress:
+            self.assertEqual(self.run_export(), 0)
+        muxed = [call.kwargs for call in progress.call_args_list if call.kwargs.get("phase") == "encoding"][-1]
+        self.assertIsNone(muxed["mux_frames"])
+        self.assertEqual(muxed["mux_seconds"], .24)
+        self.assertIn("媒体时间 0.2/0.5 秒", muxed["current_file"])
+        self.assertGreater(muxed["percent"], 90)
+
     def test_progress_advances_inside_a_file_and_exposes_estimated_duration(self):
         with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 30), \
                 patch.object(P, "report_progress") as progress:

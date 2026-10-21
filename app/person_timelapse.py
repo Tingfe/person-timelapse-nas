@@ -292,7 +292,9 @@ def scan_media_process(command, heartbeat, timeout, allow_empty=False):
             errors.seek(0)
             detail = errors.read().decode("utf-8", errors="replace")
             if process.returncode and (data or not allow_empty):
-                raise RuntimeError(f"视频读取失败（FFmpeg 退出码 {process.returncode}）")
+                reason = " ".join(detail[-2000:].split())
+                raise RuntimeError(f"视频读取失败（{Path(command[0]).name} 退出码 {process.returncode}）"
+                                   + (f"：{reason}" if reason else ""))
             return data, detail
         finally:
             if process.poll() is None:
@@ -499,14 +501,41 @@ def overlaps(start, end, event_start, event_end):
     return start <= event_end and end >= event_start
 
 
-def valid_video(path):
+def valid_video(path, heartbeat=None, *, raise_errors=False):
+    """Keep the library's bool API; exports get bounded waits and real errors."""
     try:
-        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
-                                 "-of", "json", str(path)], capture_output=True, text=True, timeout=30, check=True)
-        metadata = json.loads(result.stdout)
-        return float(metadata.get("format", {}).get("duration", 0)) > 0 and any(
-            stream.get("codec_type") == "video" and stream.get("width", 0) > 0 for stream in metadata.get("streams", []))
-    except (OSError, ValueError, subprocess.SubprocessError):
+        timeout = 30.0
+        if heartbeat is not None:
+            try:
+                timeout = float(os.environ.get("VIDEO_VALIDATION_TIMEOUT_SECONDS", "180"))
+            except ValueError:
+                timeout = 0
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise RuntimeError("VIDEO_VALIDATION_TIMEOUT_SECONDS 必须为有限正数")
+        data, _ = scan_media_process(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+             "-of", "json", str(path)], heartbeat if heartbeat is not None else lambda: None, timeout)
+        try:
+            metadata = json.loads(data)
+        except (ValueError, UnicodeError) as error:
+            raise RuntimeError(f"ffprobe 返回了无效 JSON：{error}") from None
+        if (not isinstance(metadata, dict) or not isinstance(metadata.get("format"), dict)
+                or not isinstance(metadata.get("streams"), list)):
+            raise RuntimeError("ffprobe 返回的视频元数据结构不完整")
+        try:
+            duration = float(metadata["format"].get("duration", 0))
+        except (ValueError, TypeError):
+            duration = 0
+        if not math.isfinite(duration) or duration <= 0:
+            raise RuntimeError("ffprobe 未读取到有效的正数视频时长")
+        if not any(isinstance(stream, dict) and stream.get("codec_type") == "video"
+                   and all(isinstance(stream.get(edge), int) and stream[edge] > 0 for edge in ("width", "height"))
+                   for stream in metadata["streams"]):
+            raise RuntimeError("ffprobe 未读取到具有有效宽高的视频流")
+        return True
+    except (OSError, ValueError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+        if raise_errors:
+            raise RuntimeError(f"视频校验失败：{error}") from None
         return False
 
 
@@ -687,6 +716,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     count = reused_frames = reused_files = file_count = 0
     written_moments = set()
     mux = {"frames": None, "seconds": 0.0, "bytes": 0}
+    validation_started = None
 
     def heartbeat(phase="exporting"):
         elapsed = max(time.monotonic() - started, .001)
@@ -700,8 +730,11 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
         current_file = (f"{'正在完成 MP4 封装' if mux_fraction == 1 else '最终拼接'} · "
                         f"{mux_position} · 文件 {mux['bytes'] / 1048576:.1f} MB") if phase == "encoding" else (
                             record["path"].name if jobs else "没有可合成素材")
-        report_progress(phase=phase, percent=round(90 + mux_fraction * 9, 1) if phase == "encoding" else
-                        round(min(90, (done_work + file_count) / max(total_work, 1) * 90), 1),
+        if phase == "validating":
+            current_file = f"正在校验成片 · 已等待 {max(0, time.monotonic() - validation_started):.0f} 秒"
+        percent = 99 if phase == "validating" else (round(90 + mux_fraction * 9, 1) if phase == "encoding" else
+                  round(min(90, (done_work + file_count) / max(total_work, 1) * 90), 1))
+        report_progress(phase=phase, percent=percent,
                         current_file=current_file, file_index=index if jobs else 0,
                         total_files=len(jobs), frames=count, estimated_frames=total_work,
                         output_seconds=round(count / fps, 1), estimated_output_seconds=round(total_work / fps, 1),
@@ -787,7 +820,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
                     if not file_count or wait_export_process(process, heartbeat) != 0:
                         errors.seek(0)
                         raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-1000:] or "未能编码有效片段")
-                if not valid_video(fragment_temp):
+                if not valid_video(fragment_temp, heartbeat, raise_errors=True):
                     raise RuntimeError("片段校验失败")
                 after = record["path"].stat()
                 if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
@@ -857,8 +890,31 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             if wait_export_process(process, lambda: heartbeat("encoding"), activity=concat_activity) != 0:
                 errors.seek(0)
                 raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-2000:] or "片段拼接失败")
-        if not valid_video(temporary):
-            raise RuntimeError("成片校验失败，原有视频已保留")
+        validation_started = time.monotonic()
+        heartbeat("validating")
+        try:
+            if not valid_video(temporary, lambda: heartbeat("validating"), raise_errors=True):
+                raise RuntimeError("校验器未确认有效视频")
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            reason = str(error)[-3000:]
+            failed = output_root / ".failed-exports" / f"{target.stem}-{uuid.uuid4().hex}.mp4"
+            warnings = []
+            try:
+                failed.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary, failed)
+            except OSError as preserve_error:
+                failed = Path(temporary)
+                warnings.append(f"诊断目录保存失败，临时成片保留在原位：{preserve_error}")
+            temporary = None  # Never delete the only evidence of a failed validation.
+            try:
+                atomic_json(failed.with_suffix(".json"), {"stage": "validation", "error": reason,
+                            "created_at": datetime.now(timezone.utc).isoformat(), "target": target.name,
+                            "frames": count, "fps": fps, "size_bytes": failed.stat().st_size})
+            except OSError as metadata_error:
+                warnings.append(f"诊断记录保存失败：{metadata_error}")
+            raise RuntimeError(f"成片校验失败：{reason}。原有视频和完整片段已保留；"
+                               f"待诊断成片：{failed.relative_to(output_root)}"
+                               + (f"；{'；'.join(warnings)}" if warnings else "")) from None
         os.replace(temporary, target)
         stat = target.stat()
         atomic_json(target.with_suffix(".json"), {"status": "partial" if failures or scan_failed_files else "completed",
@@ -870,7 +926,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
         if process and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
-        for path in [Path(temporary), *transient, *([Path(manifest)] if manifest else [])]:
+        for path in [*([Path(temporary)] if temporary else []), *transient, *([Path(manifest)] if manifest else [])]:
             path.unlink(missing_ok=True)
     report_progress(phase="partial" if failures or scan_failed_files else "completed", percent=100,
                     file_index=len(jobs), total_files=len(jobs), frames=count, failed_files=len(failures),

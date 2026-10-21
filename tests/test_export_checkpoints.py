@@ -140,6 +140,71 @@ class ExportCheckpointTests(unittest.TestCase):
         with patch.object(P, "decode_export_frames", side_effect=AssertionError("checkpoint was decoded again")):
             self.assertEqual(self.run_export(), 0)
         self.assertEqual(self.metadata()["reused_files"], 2)
+
+    def test_final_validation_failure_retains_evidence_and_retry_reuses_all_fragments(self):
+        self.output.mkdir()
+        target = self.output / "people-timelapse-0-20240101-20240102.mp4"
+        target.write_bytes(b"previous good video")
+        target.with_suffix(".json").write_text('{"status":"completed"}')
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.object(P, "valid_video", side_effect=[True, True, RuntimeError("ffprobe: moov atom not found")]), \
+                patch.object(P, "report_progress") as progress:
+            with self.assertRaisesRegex(RuntimeError, "成片校验失败.*moov atom not found.*failed-exports"):
+                self.run_export()
+        self.assertEqual(target.read_bytes(), b"previous good video")
+        self.assertEqual(json.loads(target.with_suffix(".json").read_text()), {"status": "completed"})
+        retained = list((self.output / ".failed-exports").glob("*.mp4"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"generated encoded video")
+        diagnostic = json.loads(retained[0].with_suffix(".json").read_text())
+        self.assertEqual((diagnostic["stage"], diagnostic["frames"], diagnostic["target"]),
+                         ("validation", 12, target.name))
+        self.assertIn("moov atom not found", diagnostic["error"])
+        validating = [call.kwargs for call in progress.call_args_list if call.kwargs["phase"] == "validating"]
+        self.assertTrue(validating)
+        self.assertTrue(all(item["percent"] == 99 and "校验成片" in item["current_file"] for item in validating))
+        self.assertFalse(any(call.kwargs["phase"] == "completed" for call in progress.call_args_list))
+        self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("completed fragment decoded again")):
+            self.assertEqual(self.run_export(), 0)
+        self.assertEqual(self.metadata()["reused_files"], 2)
+        self.assertTrue(retained[0].exists(), "retry must not remove diagnostic evidence")
+
+    def test_validation_retention_failure_does_not_delete_temporary_evidence_or_mask_reason(self):
+        self.output.mkdir()
+        (self.output / ".failed-exports").write_bytes(b"directory blocked for test")
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.object(P, "valid_video", side_effect=[True, True, RuntimeError("probe timeout")]):
+            with self.assertRaisesRegex(RuntimeError, "probe timeout.*临时成片保留在原位"):
+                self.run_export()
+        retained = list(self.output.glob("*.partial.mp4"))
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].with_suffix(".json").exists())
+        self.assertFalse((self.output / "people-timelapse-0-20240101-20240102.mp4").exists())
+
+    def test_validation_diagnostic_write_failure_still_retains_video_and_original_reason(self):
+        save = P.atomic_json
+
+        def fail_diagnostic(path, value):
+            if path.parent.name == ".failed-exports":
+                raise OSError("diagnostic disk full")
+            return save(path, value)
+
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.object(P, "valid_video", side_effect=[True, True, RuntimeError("bad duration")]), \
+                patch.object(P, "atomic_json", side_effect=fail_diagnostic):
+            with self.assertRaisesRegex(RuntimeError, "bad duration.*诊断记录保存失败"):
+                self.run_export()
+        self.assertEqual(len(list((self.output / ".failed-exports").glob("*.mp4"))), 1)
+
+    def test_validation_interruption_is_cancelled_not_retained_as_a_bad_video(self):
+        with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.object(P, "valid_video", side_effect=[True, True, KeyboardInterrupt()]):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_export()
+        self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
+        self.assertFalse((self.output / ".failed-exports").exists())
+        self.assertEqual(len(list((self.output / ".export-cache/v1").glob("*.mp4"))), 2)
         self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
 
     def test_concat_timeout_preserves_old_video_and_reuses_all_completed_fragments(self):

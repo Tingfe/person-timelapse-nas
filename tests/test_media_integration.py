@@ -48,6 +48,9 @@ class MediaIntegrationTests(unittest.TestCase):
         self.assertTrue(any(item.get("mux_seconds", 0) > 0 and item.get("mux_bytes", 0) > 0 for item in muxed), muxed)
         self.assertTrue(all(item.get("mux_frames") is None or 0 <= item["mux_frames"] <= 8 for item in muxed), muxed)
         self.assertTrue(all(90 <= item["percent"] <= 99 for item in muxed))
+        validating = [call.kwargs for call in progress.call_args_list if call.kwargs.get("phase") == "validating"]
+        self.assertTrue(validating)
+        self.assertTrue(all(item["percent"] == 99 for item in validating))
         target = self.output / "people-timelapse-0-20240101-20240102.mp4"
         self.assertTrue(P.valid_video(target))
         self.assertEqual(json.loads(target.with_suffix(".json").read_text())["frames"], 8)
@@ -68,6 +71,25 @@ class MediaIntegrationTests(unittest.TestCase):
             P.export(self.records, events, self.output, "0", "20240101", 1, 4)
         self.assertEqual(target.read_bytes(), original)
         self.assertEqual(list(self.output.glob("*.partial.mp4")), [])
+
+    def test_final_validation_failure_retains_real_video_and_cached_retry(self):
+        events = [(r["start"], r["end"]) for r in self.records]
+        day = "20240101-20240102"
+        P.export(self.records, events, self.output, "0", day, 1, 4)
+        target = self.output / f"people-timelapse-0-{day}.mp4"
+        original = target.read_bytes()
+        with patch.object(P, "valid_video", side_effect=RuntimeError("simulated probe timeout")), \
+                self.assertRaisesRegex(RuntimeError, "simulated probe timeout"):
+            P.export(self.records, events, self.output, "0", day, 1, 4)
+        self.assertEqual(target.read_bytes(), original)
+        failed = next((self.output / ".failed-exports").glob("*.mp4"))
+        self.assertTrue(P.valid_video(failed))
+        with patch.object(W, "OUTPUT_ROOT", self.output):
+            self.assertEqual(len(W.timelapses()), 1, "diagnostic video is not a published export")
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("complete cache decoded again")):
+            self.assertEqual(P.export(self.records, events, self.output, "0", day, 1, 4), 0)
+        self.assertEqual(json.loads(target.with_suffix(".json").read_text())["reused_files"], 2)
+        self.assertTrue(failed.exists())
 
     def test_scan_failures_are_disclosed_in_playable_export(self):
         record = self.records[0]

@@ -617,16 +617,36 @@ def export_batches(record, intervals, frame_seconds, excluded):
             left += count * frame_seconds
 
 
-def wait_export_process(process, heartbeat):
-    started = time.monotonic()
-    timeout = float(os.environ.get("ENCODE_TIMEOUT_SECONDS", "300"))
+def wait_export_process(process, heartbeat, *, activity=None):
+    # Encoding drains one source file. Final concatenation can span a year;
+    # distinguish real media/file progress from a merely responsive heartbeat.
+    name, default = ("CONCAT_TIMEOUT_SECONDS", "21600") if activity else ("ENCODE_TIMEOUT_SECONDS", "300")
+    timeout = float(os.environ.get(name, default))
+    stall = float(os.environ.get("CONCAT_STALL_SECONDS", "600")) if activity else timeout
+    if not all(math.isfinite(value) and value > 0 for value in (timeout, stall)):
+        raise ValueError("视频编码/拼接超时设置必须是有限的正数")
+    started = last_activity = time.monotonic()
+    previous = activity() if activity else None
     while True:
-        if time.monotonic() - started >= timeout:
-            raise RuntimeError("视频编码或拼接超时")
         try:
-            return process.wait(timeout=2)
+            result = process.wait(timeout=2)
         except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            if activity:
+                current = activity()
+                if current != previous:
+                    previous, last_activity = current, now
             heartbeat()
+            if now - started >= timeout:
+                label = "视频拼接达到总时限" if activity else "视频编码超时"
+                raise RuntimeError(f"{label}（{timeout:g} 秒）；已完成片段已保留，可重试")
+            if activity and now - last_activity >= stall:
+                raise RuntimeError(f"视频拼接连续 {stall:g} 秒无进展；已完成片段已保留，可重试")
+        else:
+            if activity:
+                activity()
+                heartbeat()
+            return result
 
 
 def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int,
@@ -666,19 +686,25 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
     transient, fragments, failures, adjustments = [], [], {}, []
     count = reused_frames = reused_files = file_count = 0
     written_moments = set()
+    mux = {"frames": 0, "seconds": 0.0, "bytes": 0}
 
     def heartbeat(phase="exporting"):
         elapsed = max(time.monotonic() - started, .001)
         fresh = count - reused_frames
         rate = fresh / elapsed
         eta = max(0, total_work - done_work - file_count) / rate if fresh >= 10 else None
-        report_progress(phase=phase, percent=95 if phase == "encoding" else
+        mux_fraction = min(1, mux["frames"] / max(count, 1))
+        current_file = (f"{'正在完成 MP4 封装' if mux_fraction == 1 else '最终拼接'} · "
+                        f"{mux['frames']}/{count} 帧 · 文件 {mux['bytes'] / 1048576:.1f} MB") if phase == "encoding" else (
+                            record["path"].name if jobs else "没有可合成素材")
+        report_progress(phase=phase, percent=round(90 + mux_fraction * 9, 1) if phase == "encoding" else
                         round(min(90, (done_work + file_count) / max(total_work, 1) * 90), 1),
-                        current_file=record["path"].name if jobs else "没有可合成素材", file_index=index if jobs else 0,
+                        current_file=current_file, file_index=index if jobs else 0,
                         total_files=len(jobs), frames=count, estimated_frames=total_work,
                         output_seconds=round(count / fps, 1), estimated_output_seconds=round(total_work / fps, 1),
                         reused_files=reused_files, reused_frames=reused_frames, frames_per_second=round(rate, 2),
                         failed_files=len(failures), duration_adjusted_files=len(adjustments),
+                        mux_frames=mux["frames"], mux_bytes=mux["bytes"], mux_seconds=mux["seconds"],
                         decode_mode=os.environ.get("EXPORT_DECODE_MODE", "keyframes"),
                         elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta) if eta is not None and phase == "exporting" else None)
 
@@ -800,11 +826,32 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             for fragment in fragments:
                 stream.write(f"file '{fragment.relative_to(output_root).as_posix()}'\n")
         heartbeat("encoding")
-        with tempfile.TemporaryFile() as errors:
+        with tempfile.TemporaryFile() as errors, tempfile.TemporaryFile() as progress:
+            def concat_activity():
+                # pread does not move FFmpeg's shared stdout file offset. Read a
+                # bounded tail, ignoring an incomplete record during a write.
+                length = os.fstat(progress.fileno()).st_size
+                data = os.pread(progress.fileno(), 8192, max(0, length - 8192)).rpartition(b"\n")[0]
+                for line in data.splitlines():
+                    key, separator, value = line.partition(b"=")
+                    field = {b"frame": "frames", b"out_time_us": "seconds"}.get(key)
+                    if separator and field:
+                        try:
+                            number = int(value)
+                            mux[field] = max(mux[field], number / 1000000 if field == "seconds" else number)
+                        except ValueError:
+                            pass
+                stat = Path(temporary).stat()
+                mux["bytes"] = stat.st_size
+                # faststart may rewrite the file without changing its size or
+                # frame count; actual writes still update mtime on disk.
+                return mux["frames"], mux["seconds"], stat.st_size, stat.st_mtime_ns
+
             process = subprocess.Popen(["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                                        "-nostats", "-stats_period", "2", "-progress", "pipe:1",
                                         "-f", "concat", "-safe", "0", "-i", manifest,
-                                        "-c", "copy", "-movflags", "+faststart", temporary], stderr=errors)
-            if wait_export_process(process, lambda: heartbeat("encoding")) != 0:
+                                        "-c", "copy", "-movflags", "+faststart", temporary], stdout=progress, stderr=errors)
+            if wait_export_process(process, lambda: heartbeat("encoding"), activity=concat_activity) != 0:
                 errors.seek(0)
                 raise RuntimeError(errors.read().decode("utf-8", errors="replace")[-2000:] or "片段拼接失败")
         if not valid_video(temporary):

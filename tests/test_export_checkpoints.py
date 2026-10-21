@@ -142,6 +142,64 @@ class ExportCheckpointTests(unittest.TestCase):
         self.assertEqual(self.metadata()["reused_files"], 2)
         self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
 
+    def test_concat_timeout_preserves_old_video_and_reuses_all_completed_fragments(self):
+        self.output.mkdir()
+        target = self.output / "people-timelapse-0-20240101-20240102.mp4"
+        target.write_bytes(b"previous good video")
+        wait = P.wait_export_process
+
+        def timeout_concat(process, heartbeat, **kwargs):
+            if kwargs.get("activity") is not None:
+                raise RuntimeError("视频拼接连续 600 秒无进展")
+            return wait(process, heartbeat, **kwargs)
+
+        with patch.object(P, "wait_export_process", side_effect=timeout_concat), \
+                patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6):
+            with self.assertRaisesRegex(RuntimeError, "拼接.*无进展"):
+                self.run_export()
+        self.assertEqual(target.read_bytes(), b"previous good video")
+        self.assertEqual(len(list((self.output / ".export-cache/v1").glob("*.mp4"))), 2)
+        self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("completed fragment decoded again")):
+            self.assertEqual(self.run_export(), 0)
+        self.assertEqual(self.metadata()["reused_files"], 2)
+
+    def test_repeated_ffmpeg_status_is_not_mistaken_for_actual_concat_progress(self):
+        clock = [0]
+        processes = []
+
+        def stalled_concat(command, **kwargs):
+            process = self.fake_encoder(command, **kwargs)
+            if "concat" not in command:
+                return process
+            processes.append(process)
+            killed = [False]
+            process.poll.side_effect = lambda: -9 if killed[0] else None
+            process.kill.side_effect = lambda: killed.__setitem__(0, True)
+            kwargs["stdout"].write(b"frame=12\nout_time_us=480000\nprogress=continue\n")
+            kwargs["stdout"].flush()
+
+            def wait(timeout):
+                if killed[0]:
+                    return -9
+                clock[0] += 200
+                kwargs["stdout"].write(b"frame=12\nout_time_us=480000\nprogress=continue\n")
+                kwargs["stdout"].flush()
+                raise P.subprocess.TimeoutExpired("generated ffmpeg", timeout)
+            process.wait.side_effect = wait
+            return process
+
+        with patch.object(P.subprocess, "Popen", side_effect=stalled_concat), \
+                patch.object(P.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 6), \
+                patch.dict(P.os.environ, {"CONCAT_STALL_SECONDS": "600", "CONCAT_TIMEOUT_SECONDS": "21600"}):
+            with self.assertRaisesRegex(RuntimeError, "拼接.*无进展"):
+                self.run_export()
+        self.assertEqual(clock[0], 600)
+        processes[0].kill.assert_called_once()
+        self.assertEqual(len(list((self.output / ".export-cache/v1").glob("*.mp4"))), 2)
+        self.assertEqual(list(self.output.rglob("*.partial.mp4")), [])
+
     def test_progress_advances_inside_a_file_and_exposes_estimated_duration(self):
         with patch.object(P, "decode_export_frames", return_value=[b"jpeg"] * 30), \
                 patch.object(P, "report_progress") as progress:

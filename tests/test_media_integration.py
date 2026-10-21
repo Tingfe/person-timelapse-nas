@@ -40,7 +40,11 @@ class MediaIntegrationTests(unittest.TestCase):
     def test_multi_day_streaming_export_and_library(self):
         events = [(r["start"], r["end"]) for r in self.records]
         # Deliberate duplicates also verify overlap deduplication and ordering.
-        self.assertEqual(P.export(list(reversed(self.records)) * 2, events, self.output, "0", "20240101-20240102", 1, 4), 0)
+        with patch.object(P, "report_progress") as progress:
+            self.assertEqual(P.export(list(reversed(self.records)) * 2, events, self.output, "0", "20240101-20240102", 1, 4), 0)
+        muxed = [call.kwargs for call in progress.call_args_list if call.kwargs.get("phase") == "encoding"]
+        self.assertTrue(any(item.get("mux_frames") == 8 and item.get("mux_bytes", 0) > 0 for item in muxed))
+        self.assertTrue(all(90 <= item["percent"] <= 99 for item in muxed))
         target = self.output / "people-timelapse-0-20240101-20240102.mp4"
         self.assertTrue(P.valid_video(target))
         self.assertEqual(json.loads(target.with_suffix(".json").read_text())["frames"], 8)

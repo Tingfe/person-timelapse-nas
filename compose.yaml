@@ -10,6 +10,9 @@ services:
       - /你的/小米录像目录:/input:ro
       - ./output:/output
       - ./models:/models
+      # Optional extra folders; choose /recordings or /exports in Web directory settings.
+      # - ./recordings:/recordings:ro
+      # - ./exports:/exports
     ports:
       - "8790:8790"
     restart: unless-stopped

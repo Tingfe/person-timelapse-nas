@@ -4,6 +4,7 @@
 import json
 import copy
 import hmac
+import hashlib
 import os
 import re
 import secrets
@@ -20,11 +21,13 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from person_timelapse import (commit_result, load_ledger, parse_record, source_id,
                              scan_settings, settings_satisfied, valid_video)
 from storage import atomic_json, shared_lock
+from directory_settings import checked_directory, list_directories
+from person_timelapse import video_paths
 
 
 INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
@@ -34,6 +37,14 @@ TASKS_PATH = OUTPUT_ROOT / "tasks.json"
 INVENTORY_DB_PATH = OUTPUT_ROOT / "inventory.sqlite3"
 MAC_PRIORITY_PATH = OUTPUT_ROOT / ".mac-priority.lock"
 PASSWORD_PATH = OUTPUT_ROOT / ".access-password"
+DEFAULT_INPUT_ROOT = INPUT_ROOT
+DIRECTORY_SETTINGS_PATH = OUTPUT_ROOT / ".directory-settings.json"
+SCAN_ROOTS = [Path(value) for value in os.environ.get("DIRECTORY_SCAN_ROOTS", f"{INPUT_ROOT}:/recordings").split(os.pathsep) if value]
+EXPORT_ROOTS = [Path(value) for value in os.environ.get("DIRECTORY_EXPORT_ROOTS", f"{OUTPUT_ROOT}:/exports").split(os.pathsep) if value]
+EXPORT_ROOT = None  # None retains the original /output behavior, including CLI users.
+EXPORT_HISTORY = []
+DIRECTORY_SETTINGS_ERROR = ""
+DIRECTORY_LOCK = threading.RLock()
 DATE_PATTERN = re.compile(r"^\d{8}$")
 CAMERA_PATTERN = re.compile(r"^(?:\d+|legacy)$")
 TIMELAPSE_PATTERN = re.compile(r"^people-timelapse-(\d+|legacy)-(\d{8})(?:-(\d{8}))?\.mp4$")
@@ -73,6 +84,91 @@ def read_json(path, fallback):
 
 def write_json(path, value):
     atomic_json(path, value)
+
+
+def export_directories():
+    return list(dict.fromkeys([EXPORT_ROOT or OUTPUT_ROOT, OUTPUT_ROOT, *EXPORT_HISTORY]))
+
+
+def directory_key(path):
+    return hashlib.sha256(str(path).encode()).hexdigest()[:16]
+
+
+def directory_snapshot():
+    def mounts(roots):
+        return [{"path": str(root), "available": root.is_dir()} for root in roots]
+    return {"input_root": str(INPUT_ROOT), "export_root": str(EXPORT_ROOT or OUTPUT_ROOT),
+            "state_root": str(OUTPUT_ROOT), "scan_roots": mounts(SCAN_ROOTS),
+            "export_roots": mounts(EXPORT_ROOTS), "diagnostics": copy.deepcopy(OVERVIEW["diagnostics"]),
+            "indexing": inventory_status()["indexing"], "settings_error": DIRECTORY_SETTINGS_ERROR}
+
+
+def load_directory_settings():
+    global INPUT_ROOT, EXPORT_ROOT, EXPORT_HISTORY, INVENTORY_DB_PATH, DIRECTORY_SETTINGS_ERROR
+    if not DIRECTORY_SETTINGS_PATH.exists():
+        return
+    # Invalid saved settings must be visible, never silently switch to another source.
+    try:
+        saved = json.loads(DIRECTORY_SETTINGS_PATH.read_text(encoding="utf-8"))
+        source = checked_directory(saved["input_root"], SCAN_ROOTS)
+        destination = checked_directory(saved["export_root"], EXPORT_ROOTS, writable=True)
+        history = []
+        for value in saved.get("export_history", []):
+            try:
+                history.append(checked_directory(value, EXPORT_ROOTS))
+            except (ValueError, OSError):
+                continue  # A removed historical export mount must not break the console.
+        INPUT_ROOT, EXPORT_ROOT, EXPORT_HISTORY = source, destination, history
+        INVENTORY_DB_PATH = inventory_database(INPUT_ROOT)
+        DIRECTORY_SETTINGS_ERROR = ""
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        DIRECTORY_SETTINGS_ERROR = f"已保存的目录不可用，任务暂不启动。请打开目录设置重新保存：{error}"
+        print(f"[directories] {DIRECTORY_SETTINGS_ERROR}", flush=True)
+
+
+def inventory_database(root):
+    # Keep the legacy shared Mac/NAS index untouched when choosing a subfolder.
+    return OUTPUT_ROOT / ("inventory.sqlite3" if root == DEFAULT_INPUT_ROOT else
+                          f"inventory-{directory_key(root)}.sqlite3")
+
+
+def update_directories(payload):
+    global INPUT_ROOT, EXPORT_ROOT, EXPORT_HISTORY, INVENTORY_DB_PATH, DIRECTORY_SETTINGS_ERROR
+    if not isinstance(payload, dict):
+        raise ValueError("目录设置格式无效")
+    with DIRECTORY_LOCK, LOCK:
+        source = checked_directory(payload.get("input_root"), SCAN_ROOTS)
+        value = payload.get("export_root")
+        if isinstance(value, str) and (source == Path(value) or source.is_relative_to(Path(value))):
+            raise ValueError("成片目录不能等于或包含录像目录，以免混入源录像")
+        if any(task.get("status") in {"running", "queued", "paused", "blocked"} for task in load_tasks()["tasks"]):
+            raise RuntimeError("请先完成或取消待执行任务，再修改目录；暂停任务仍需保留原目录")
+        if mac_priority_active():
+            raise RuntimeError("Mac 正在协处理，请先停止 Mac 工作节点再修改目录")
+        with INVENTORY_LOCK:
+            if INVENTORY["indexing"]:
+                raise RuntimeError("正在建立索引，请等待完成后修改目录；当前目录仍可继续使用")
+        destination = checked_directory(value, EXPORT_ROOTS, writable=True, create=True)
+        history = list(dict.fromkeys([*EXPORT_HISTORY, EXPORT_ROOT or OUTPUT_ROOT, destination]))
+        tasks = load_tasks()
+        for task in tasks["tasks"]:
+            task.setdefault("input_root", str(INPUT_ROOT))
+            task.setdefault("export_root", str(EXPORT_ROOT or OUTPUT_ROOT))
+            task.setdefault("inventory_database", str(INVENTORY_DB_PATH))
+        save_tasks(tasks)  # Legacy retries must keep their original source and destination.
+        write_json(DIRECTORY_SETTINGS_PATH, {"input_root": str(source), "export_root": str(destination),
+                                           "export_history": [str(path) for path in history]})
+        changed = source != INPUT_ROOT
+        INPUT_ROOT, EXPORT_ROOT, EXPORT_HISTORY = source, destination, history
+        DIRECTORY_SETTINGS_ERROR = ""
+        INVENTORY_DB_PATH = inventory_database(source)
+        if changed:
+            with INVENTORY_LOCK:
+                INVENTORY.update({"updated_at": 0.0, "records": [], "diagnostics": {}, "indexing": False})
+            OVERVIEW.update({"dates": [], "diagnostics": {}, "indexing": True})
+        METADATA_DIRTY.set()
+        inventory_snapshot()
+        return directory_snapshot()
 
 
 def load_tasks():
@@ -288,7 +384,11 @@ def event_summary(date, total_files=0, processed_files=0, scan_status="pending",
 def timelapses():
     """List finished videos once so the console can surface them as first-class results."""
     items = []
-    for file in OUTPUT_ROOT.glob("people-timelapse-*.mp4"):
+    files = [file for root in export_directories() for file in root.glob("people-timelapse-*.mp4")]
+    names = set()
+    for file in files:
+        if file.name in names:
+            continue
         match = TIMELAPSE_PATTERN.fullmatch(file.name)
         if not match:
             continue
@@ -305,7 +405,9 @@ def timelapses():
                 continue
             metadata = {"status": "completed", "validated": True, "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
             write_json(file.with_suffix(".json"), metadata)
-        items.append({"name": file.name, "camera": camera, "start_date": start_date,
+        names.add(file.name)
+        items.append({"name": file.name, "media_path": f"exports/{directory_key(file.parent)}/{file.name}",
+                      "directory": str(file.parent), "camera": camera, "start_date": start_date,
                       "end_date": end_date or start_date, "size_bytes": stat.st_size,
                       "status": metadata.get("status", "completed"),
                       "failed_files": len(metadata.get("failed_files", [])),
@@ -343,11 +445,10 @@ def build_inventory(root, database):
             camera TEXT NOT NULL, start TEXT NOT NULL, ending TEXT NOT NULL, seen TEXT NOT NULL)""")
         connection.execute("CREATE INDEX IF NOT EXISTS videos_start ON videos(start)")
         scan_id = uuid.uuid4().hex
+        reported_at = time.monotonic()
         records, mp4_files = [], 0
         previous_count = connection.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        for path in root.rglob("*.mp4"):
-            if not path.is_file():
-                continue
+        for path in video_paths(root):
             mp4_files += 1
             relative = str(path.relative_to(root))
             stat = path.stat()
@@ -371,6 +472,14 @@ def build_inventory(root, database):
                 record["size"] = stat.st_size
                 connection.execute("UPDATE videos SET seen=? WHERE path=?", (scan_id, relative))
                 records.append(record)
+            if time.monotonic() - reported_at >= 2:
+                reported_at = time.monotonic()
+                if root == INPUT_ROOT and database == INVENTORY_DB_PATH:
+                    with INVENTORY_LOCK:
+                        if INVENTORY["indexing"]:
+                            INVENTORY["diagnostics"].update({"path": str(root), "available": True,
+                                "checked_files": mp4_files, "recognized_files": len(records),
+                                "message": f"正在检查录像目录：已检查 {mp4_files} 个 MP4，识别 {len(records)} 个录像。"})
         if previous_count and not mp4_files:
             connection.rollback()
             raise RuntimeError("本次未发现任何 MP4，已保留原有索引；请检查录像目录挂载。")
@@ -406,6 +515,8 @@ def refresh_inventory():
     now = time.monotonic()
     records = []
     try:
+        if DIRECTORY_SETTINGS_ERROR:
+            raise RuntimeError(DIRECTORY_SETTINGS_ERROR)
         if not INPUT_ROOT.is_dir():
             snapshot = {
                 "updated_at": now, "records": [],
@@ -429,6 +540,7 @@ def refresh_inventory():
                 "updated_at": now, "records": records,
                 "diagnostics": {"path": str(INPUT_ROOT), "available": True, "children": children,
                                 "mp4_files": mp4_files, "recognized_files": len(records),
+                                "scanned_at": now_iso(),
                                 "index_database": str(INVENTORY_DB_PATH),
                                 "examples": [str(record["path"].relative_to(INPUT_ROOT)) for record in records[:3]]},
             }
@@ -445,6 +557,11 @@ def refresh_inventory():
 
 
 def inventory_snapshot():
+    with DIRECTORY_LOCK:
+        return _inventory_snapshot()
+
+
+def _inventory_snapshot():
     """Return immediately; refresh the large NAS inventory in one background worker."""
     now = time.monotonic()
     with INVENTORY_LOCK:
@@ -516,15 +633,23 @@ def inventory_status():
 
 
 def refresh_overview():
-    """All archive reads happen off the HTTP request path."""
-    snapshot = inventory_snapshot()
+    with DIRECTORY_LOCK:
+        roots = (INPUT_ROOT, EXPORT_ROOT, tuple(EXPORT_HISTORY))
+        snapshot = inventory_snapshot()
+    # Slow NAS reads must not hold the directory mutex on the HTTP request path.
     try:
         dates = available_dates(snapshot)
         library = timelapses()
-        OVERVIEW.update({"dates": dates, "timelapses": library, "diagnostics": snapshot["diagnostics"],
-                         "indexing": snapshot["indexing"], "updated_at": time.time()})
+        with DIRECTORY_LOCK:
+            if roots != (INPUT_ROOT, EXPORT_ROOT, tuple(EXPORT_HISTORY)):
+                METADATA_DIRTY.set()
+                return
+            OVERVIEW.update({"dates": dates, "timelapses": library, "diagnostics": snapshot["diagnostics"],
+                             "indexing": snapshot["indexing"], "updated_at": time.time()})
     except Exception as error:
-        OVERVIEW["diagnostics"] = {"message": f"结果索引读取失败：{error}"}
+        with DIRECTORY_LOCK:
+            if roots == (INPUT_ROOT, EXPORT_ROOT, tuple(EXPORT_HISTORY)):
+                OVERVIEW["diagnostics"] = {"message": f"结果索引读取失败：{error}"}
 
 
 def metadata_loop():
@@ -539,7 +664,8 @@ def status_snapshot():
     document = load_tasks()
     return {"tasks": tasks, "plans": public_plans(document), "queue_paused": document.get("paused", False),
             "queued_count": sum(t["status"] == "queued" for t in tasks),
-            "indexing": inventory_status()["indexing"]}
+            "indexing": inventory_status()["indexing"],
+            "index_progress": copy.deepcopy(INVENTORY["diagnostics"]) if INVENTORY["indexing"] else None}
 
 
 def task_command(task):
@@ -550,13 +676,15 @@ def task_command(task):
     command = [sys.executable, "-u", str(APP_ROOT / "person_timelapse.py")]
     if task["kind"] == "scan":
         settings = PROFILES[task["profile"]]
-        command += ["scan", str(INPUT_ROOT), str(OUTPUT_ROOT), "--date", task["date"],
+        command += ["scan", task.get("input_root", str(INPUT_ROOT)), str(OUTPUT_ROOT), "--date", task["date"],
                     "--run-id", task["id"],
                     "--sample-seconds", settings["sample_seconds"], "--motion-threshold", settings["motion_threshold"],
                     "--keepalive-seconds", "60", "--imgsz", settings["imgsz"]]
         return command + (["--force"] if task.get("force") else []) + (["--retry-failed"] if task.get("retry_failed") else [])
     events = [str(OUTPUT_ROOT / f"events-{day}.json") for day in task["dates"]]
-    return command + ["export", str(INPUT_ROOT), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
+    command += ["export", task.get("input_root", str(INPUT_ROOT)), str(OUTPUT_ROOT), *events, "--camera", task["camera"]]
+    destination = task.get("export_root") or EXPORT_ROOT
+    return command + (["--destination", str(destination)] if destination else [])
 
 
 def dependency_state(task, tasks):
@@ -617,6 +745,8 @@ def mac_priority_active():
 
 
 def start_next_task():
+    if DIRECTORY_SETTINGS_ERROR:
+        return
     while True:
         with LOCK:
             if mac_priority_active():
@@ -746,7 +876,7 @@ def task_worker(task, command, progress_file):
     runtime = Path(os.environ.get("RUNTIME_ROOT", tempfile.gettempdir())) / "person-timelapse"
     progress_path = runtime / progress_file
     environment["PROGRESS_PATH"] = str(progress_path)
-    environment["INVENTORY_DB_PATH"] = str(INVENTORY_DB_PATH)
+    environment["INVENTORY_DB_PATH"] = task.get("inventory_database", str(INVENTORY_DB_PATH))
     initial = {
         "phase": "starting",
         "percent": 0,
@@ -850,6 +980,13 @@ def task_worker(task, command, progress_file):
 
 
 def create_task(payload):
+    with DIRECTORY_LOCK:
+        return _create_task(payload)
+
+
+def _create_task(payload):
+    if DIRECTORY_SETTINGS_ERROR:
+        raise ValueError(DIRECTORY_SETTINGS_ERROR)
     kind = payload.get("kind")
     date = payload.get("date", "")
     if kind not in {"scan", "export", "timelapse"} or not DATE_PATTERN.fullmatch(date):
@@ -937,6 +1074,9 @@ def create_task(payload):
             task["progress_file"] = f"progress-{task['id']}.json"
             tasks["tasks"].append(task)
             created.append(task)
+        for item in created:
+            item.update({"input_root": str(INPUT_ROOT), "export_root": str(EXPORT_ROOT or OUTPUT_ROOT),
+                         "inventory_database": str(INVENTORY_DB_PATH)})
         plan_id = uuid.uuid4().hex[:8]
         tasks.setdefault("plans", []).append({
             "id": plan_id, "kind": kind, "start_date": date, "end_date": end_date,
@@ -1054,6 +1194,20 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         if path == "/api/status":
             self.send_json(status_snapshot())
             return
+        if path == "/api/directories":
+            with DIRECTORY_LOCK:
+                self.send_json(directory_snapshot())
+            return
+        if path == "/api/directories/browse":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                kind = query.get("kind", [""])[0]
+                if kind not in {"scan", "export"}:
+                    raise ValueError("请选择扫描目录或成片目录")
+                self.send_json(list_directories(query.get("path", [""])[0], SCAN_ROOTS if kind == "scan" else EXPORT_ROOTS))
+            except (ValueError, OSError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
         if path.startswith("/api/date/"):
             date = path.rsplit("/", 1)[-1]
             if not DATE_PATTERN.fullmatch(date):
@@ -1064,8 +1218,15 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/media/"):
             relative = Path(unquote(path.removeprefix("/media/")))
-            target = (OUTPUT_ROOT / relative).resolve()
-            if (OUTPUT_ROOT.resolve() not in target.parents or not target.is_file()
+            media_root = OUTPUT_ROOT
+            if relative.parts[:1] == ("exports",) and len(relative.parts) == 3:
+                media_root = next((root for root in export_directories() if directory_key(root) == relative.parts[1]), None)
+                if media_root is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                relative = Path(relative.name)
+            target = (media_root / relative).resolve()
+            if (media_root.resolve() not in target.parents or not target.is_file()
                     or target.suffix.lower() not in {".mp4", ".jpg", ".jpeg", ".png"}
                     or any(part.startswith(".") for part in relative.parts)):
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -1122,13 +1283,16 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             elif path.startswith("/api/tasks/") and path.endswith("/retry"):
                 self.send_json(retry_task(path.split("/")[-2]))
             elif path == "/api/index":
-                with INVENTORY_LOCK:
-                    INVENTORY["updated_at"] = 0
-                inventory_snapshot()
+                with DIRECTORY_LOCK:
+                    with INVENTORY_LOCK:
+                        INVENTORY["updated_at"] = 0
+                    inventory_snapshot()
                 self.send_json({"indexing": True})
+            elif path == "/api/directories":
+                self.send_json(update_directories(payload))
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, RuntimeError, OSError) as error:
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
     def do_DELETE(self):
@@ -1148,6 +1312,7 @@ def main():
     global ACCESS_PASSWORD, STATE_READY, TASK_CACHE, TASK_CACHE_PATH
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     ACCESS_PASSWORD = load_access_password()
+    load_directory_settings()
     recover_interrupted_tasks()
     TASK_CACHE, TASK_CACHE_PATH = load_tasks(), TASKS_PATH
     STATE_READY = True

@@ -5,7 +5,7 @@
   <title>影像档案室</title><link rel="stylesheet" href="/web/style.css"><script defer src="/web/app.js"></script>
 </head>
 <body>
-  <header><div><div class="eyebrow">PRIVATE ARCHIVE · LOCAL NETWORK ONLY</div><h1>影像档案室</h1></div><div class="clock" id="clock"></div></header>
+  <header><div><div class="eyebrow">PRIVATE ARCHIVE · LOCAL NETWORK ONLY</div><h1>影像档案室</h1></div><div class="header-tools"><button class="quiet" id="openDirectories">目录设置</button><div class="clock" id="clock"></div></div></header>
   <main>
     <section id="mission" class="mission empty" aria-label="当前执行状态"><div><b id="missionTitle">正在连接档案室…</b><div class="progress"><i id="missionBar"></i></div><small id="missionText">正在读取任务状态，不会重新扫描录像。</small></div><div class="metric"><span id="missionPercent">—</span><small id="elapsed">NO ACTIVE TASK</small></div></section>
     <section class="panel wide" aria-labelledby="plansHeading"><div class="panel-heading"><h2 id="plansHeading">范围任务 <small id="planCount"></small></h2><span class="subtle">扫描与合成分别计进度 · 已校验片段可续做</span></div><div id="plans" class="plans"></div><div id="planPager" class="pager"></div></section>
@@ -33,5 +33,23 @@
     </section>
   </main>
   <dialog id="player"><div class="player-heading"><h2 id="playerTitle">延时成片</h2><button id="closePlayer" class="quiet">关闭</button></div><video id="playerVideo" controls playsinline preload="metadata"></video><p id="playerInfo" class="subtle"></p><a id="downloadVideo" class="watch" download>下载成片</a></dialog>
+  <dialog id="directoryDialog" aria-labelledby="directoryTitle">
+    <div class="player-heading"><div><div class="eyebrow">STORAGE · LOCAL ONLY</div><h2 id="directoryTitle">录像与成片目录</h2></div><button id="closeDirectories" class="quiet" type="button">关闭</button></div>
+    <p class="directory-intro">选择容器已挂载的目录。原始录像只读；修改设置不会移动或删除文件。</p>
+    <form id="directoryForm" class="directory-form">
+      <label for="scanDirectory">扫描目录 <span class="subtle">递归读取其中的录像</span></label>
+      <div class="directory-input"><input id="scanDirectory" required placeholder="/input" autocomplete="off" spellcheck="false"><button class="quiet" data-browse-kind="scan" type="button">浏览</button></div>
+      <div id="scanMounts" class="mounts"></div>
+      <label for="exportDirectory">成片输出目录 <span class="subtle">只影响今后生成的视频</span></label>
+      <div class="directory-input"><input id="exportDirectory" required placeholder="/output" autocomplete="off" spellcheck="false"><button class="quiet" data-browse-kind="export" type="button">浏览</button></div>
+      <div id="exportMounts" class="mounts"></div>
+      <div id="directoryBrowser" class="directory-browser" hidden></div>
+      <div class="storage-note"><b>索引与任务保留在原位置</b><p id="stateDirectory"></p><p>旧成片继续显示，已完成的扫描与缓存不会清空。修改扫描目录后会建立对应索引；Mac 协处理也须选择相同的录像目录。</p></div>
+      <div id="directoryDiagnostics" class="directory-diagnostics"></div>
+      <p id="directoryNotice" role="status" aria-live="polite"></p>
+      <div class="directory-actions"><button class="quiet" id="directoryRefresh" type="button">检查新增录像</button><button class="action" id="saveDirectories" type="submit">保存目录设置</button></div>
+    </form>
+    <details class="mount-help"><summary>NAS 上有录像，但这里看不到？</summary><p>NAS 路径不是容器路径。先在 Compose 中将录像目录只读挂载到 <code>/input</code> 或 <code>/recordings</code>，将额外成片目录可写挂载到 <code>/exports</code>，重新创建容器后再选择。不要把整个 NAS 或 Docker socket 挂载进来。</p><p>新文件放入当前扫描目录后，点击“检查新增录像”。文件名需包含录像起止时间；支持 <code>.mp4</code> 和 <code>.MP4</code>。</p></details>
+  </dialog>
 </body>
 </html>

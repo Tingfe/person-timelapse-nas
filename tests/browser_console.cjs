@@ -40,6 +40,11 @@ const plans = Array.from({length: 4}, (_, index) => ({id: `plan-${index}`, kind:
 let model = {dates, timelapses, tasks, plans, queue_paused: false, queued_count: 9,
   diagnostics: {available: true, recognized_files: 10000, mp4_files: 10000}};
 let created = [];
+let savedDirectories = [], refreshed = 0;
+const directories = {input_root: '/input', export_root: '/output', state_root: '/output',
+  scan_roots: [{path: '/input', available: true}, {path: '/recordings', available: false}],
+  export_roots: [{path: '/output', available: true}, {path: '/exports', available: false}],
+  diagnostics: {available: true, mp4_files: 1200, recognized_files: 1198, scanned_at: '2000-01-01T12:00:00Z'}};
 
 (async () => {
   const browser = await chromium.launch({headless: true,
@@ -51,7 +56,15 @@ let created = [];
     await page.route('**/api/**', async route => {
       const request = route.request(), pathname = new URL(request.url()).pathname;
       let body = model;
-      if (pathname.startsWith('/api/date/')) {
+      if (pathname === '/api/directories') {
+        if(request.method() === 'POST')savedDirectories.push(request.postDataJSON());
+        body = directories;
+      } else if (pathname === '/api/directories/browse') {
+        const current = new URL(request.url()).searchParams.get('path');
+        body = {path: current, children: current === '/input' ? [{name:'archive', path:'/input/archive'}] : []};
+      } else if (pathname === '/api/index') {
+        refreshed++; body = {indexing: true};
+      } else if (pathname.startsWith('/api/date/')) {
         body = {events: {events: {legacy: Array.from({length: 120}, (_, index) => ({
           start: `2024-02-29T01:${String(index % 60).padStart(2, '0')}:00`,
           end: `2024-02-29T01:${String(index % 60).padStart(2, '0')}:10`, hits: 2,
@@ -167,12 +180,36 @@ let created = [];
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-desktop.png'), fullPage: true});
     await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-progress.png')});
+    await page.click('#openDirectories');
+    await page.waitForFunction(() => document.querySelector('#scanDirectory').value === '/input');
+    assert(await page.locator('[data-directory-root="/recordings"]').isDisabled());
+    await page.click('[data-browse-kind="scan"]');
+    await page.click('[data-directory-root="/input/archive"]');
+    await page.waitForFunction(() => document.querySelector('#scanDirectory').value === '/input/archive');
+    assert.equal(await page.locator('#scanDirectory').inputValue(), '/input/archive');
+    await page.fill('#exportDirectory', '/output/films');
+    await page.evaluate(() => load());
+    await page.evaluate(() => load(true));
+    assert.equal(await page.locator('#scanDirectory').inputValue(), '/input/archive');
+    assert.equal(await page.locator('#exportDirectory').inputValue(), '/output/films');
+    await page.click('#saveDirectories');
+    await page.waitForFunction(() => document.querySelector('#directoryNotice').textContent.includes('已保存'));
+    assert.deepEqual(savedDirectories, [{input_root: '/input/archive', export_root:'/output/films'}]);
+    await page.click('#directoryRefresh');
+    await page.waitForFunction(() => document.querySelector('#directoryNotice').textContent.includes('已请求刷新'));
+    assert.equal(refreshed, 1);
+    await page.screenshot({path:path.join(screenshotRoot, 'timelapse-directory-desktop.png')});
+    await page.click('#closeDirectories');
     await page.setViewportSize({width: 390, height: 844});
     await page.reload();
     await page.waitForSelector('.month');
     assert.equal(await page.locator('header').count(), 1);
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({path: path.join(screenshotRoot, 'timelapse-console-mobile.png')});
+    await page.click('#openDirectories');
+    await page.waitForFunction(() => document.querySelector('#scanDirectory').value === '/input');
+    assert(await page.locator('#directoryDialog').evaluate(node => node.scrollWidth <= node.clientWidth));
+    await page.screenshot({path:path.join(screenshotRoot, 'timelapse-directory-mobile.png')});
     assert.deepEqual(errors, []);
     assert.match(await page.locator('#timelapses').innerText(), /已按实际录像时长校正 2 个素材/);
     console.log('PASS: calendar, range selection, pagination, filters, stable refresh, player isolation, separate stage progress, checkpoint details, desktop/mobile layout.');

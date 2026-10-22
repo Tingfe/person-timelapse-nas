@@ -34,6 +34,20 @@ LEGACY_PATTERN = re.compile(
 TIME_FORMAT = "%Y%m%d%H%M%S"
 
 
+def video_paths(root):
+    """Include .MP4 while never following symlinks outside a recording mount."""
+    pending = [root]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+                elif entry.name.lower().endswith(".mp4") and entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+
+
 def parse_record(path: Path):
     match = VIDEO_PATTERN.match(path.name) or NAME_PATTERN.match(path.name)
     legacy = False
@@ -79,7 +93,7 @@ def find_records(root: Path, day: Optional[str] = None, days=None, database=None
                             "end": datetime.strptime(end, TIME_FORMAT)})
         return sorted(indexed, key=lambda item: (item["camera"], item["start"], item["path"].name))
     records = []
-    for path in root.rglob("*.mp4"):
+    for path in video_paths(root):
         record = parse_record(path)
         if record and (not day or record["start"].strftime("%Y%m%d") == day) and (
             not days or record["start"].strftime("%Y%m%d") in days
@@ -724,7 +738,7 @@ def wait_export_process(process, heartbeat, *, activity=None):
 
 
 def export(records, selected_events, output_root: Path, camera: str, day: str, frame_seconds: float, fps: int,
-           scan_failed_files=0):
+           scan_failed_files=0, destination_root=None):
     if not math.isfinite(frame_seconds) or frame_seconds <= 0 or fps <= 0:
         raise ValueError("抽帧间隔与输出帧率必须大于零")
     if not selected_events:
@@ -753,8 +767,10 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
                for _, _, intervals in jobs]
     total_work, done_work = sum(planned), 0
     started = time.monotonic()
-    target = output_root / f"people-timelapse-{camera}-{day}.mp4"
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".partial.mp4", dir=output_root)
+    destination_root = destination_root or output_root
+    destination_root.mkdir(parents=True, exist_ok=True)
+    target = destination_root / f"people-timelapse-{camera}-{day}.mp4"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".partial.mp4", dir=destination_root)
     os.close(descriptor)
     process, manifest = None, None
     transient, fragments, failures, adjustments = [], [], {}, []
@@ -958,7 +974,7 @@ def export(records, selected_events, output_root: Path, camera: str, day: str, f
             except OSError as metadata_error:
                 warnings.append(f"诊断记录保存失败：{metadata_error}")
             raise RuntimeError(f"成片校验失败：{reason}。原有视频和完整片段已保留；"
-                               f"待诊断成片：{failed.relative_to(output_root)}"
+                               f"待诊断成片：{failed.relative_to(output_root) if failed.is_relative_to(output_root) else failed}"
                                + (f"；{'；'.join(warnings)}" if warnings else "")) from None
         os.replace(temporary, target)
         stat = target.stat()
@@ -1013,6 +1029,7 @@ def main():
     export_parser.add_argument("--camera", required=True)
     export_parser.add_argument("--fps", type=int, default=25)
     export_parser.add_argument("--frame-seconds", type=float, default=1.0)
+    export_parser.add_argument("--destination", type=Path, help="finished MP4 directory; state and cache stay in output")
     inventory_parser = subparsers.add_parser("inventory")
     inventory_parser.add_argument("input", type=Path)
     inventory_parser.add_argument("--date", required=True, help="YYYYMMDD, e.g. 20000101")
@@ -1073,7 +1090,7 @@ def main():
         events = [event for path in args.events for event in read_events(path, args.camera)]
         label = days[0] if len(days) == 1 else f"{min(days)}-{max(days)}"
         return export(records, events, args.output, args.camera, label, args.frame_seconds, args.fps,
-                      sum(payload.get("failed_files", 0) for payload in payloads))
+                      sum(payload.get("failed_files", 0) for payload in payloads), destination_root=args.destination)
     elif args.command == "inventory":
         records = find_records(args.input, args.date)
         print(json.dumps([{

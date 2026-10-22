@@ -62,6 +62,22 @@ class MediaIntegrationTests(unittest.TestCase):
         with patch.object(W, "OUTPUT_ROOT", self.output):
             self.assertEqual(len(W.exports_for_date("20240102")), 1)
 
+    def test_separate_destination_keeps_cache_and_library(self):
+        destination = self.root / "exports"
+        events = [(r["start"], r["end"]) for r in self.records]
+        day = "20240101-20240102"
+        self.assertEqual(P.export(self.records, events, self.output, "0", day, 1, 4,
+                                  destination_root=destination), 0)
+        name = f"people-timelapse-0-{day}.mp4"
+        self.assertTrue(P.valid_video(destination / name))
+        self.assertFalse((self.output / name).exists())
+        self.assertTrue(list((self.output / ".export-cache" / "v1").glob("*.mp4")))
+        with patch.object(W, "OUTPUT_ROOT", self.output), patch.object(W, "EXPORT_ROOT", destination):
+            self.assertEqual(W.timelapses()[0]["name"], name)
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("reuse cached fragments")):
+            self.assertEqual(P.export(self.records, events, self.output, "0", day, 1, 4,
+                                      destination_root=destination), 0)
+
     def test_real_encoder_validation_failure_preserves_old_export(self):
         events = [(self.records[0]["start"], self.records[0]["end"])]
         P.export(self.records, events, self.output, "0", "20240101", 1, 4)

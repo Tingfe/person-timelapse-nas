@@ -12,7 +12,7 @@ const statusText={queued:'等待中',running:'运行中',completed:'已完成',p
 const scanText={pending:'待扫描',completed:'已扫描',partial:'部分完成',scanning:'扫描中',queued:'已排队'};
 const rangeLabel=item=>item.start_date===item.end_date?fmt(item.start_date):`${fmt(item.start_date)} — ${fmt(item.end_date)}`;
 const fileSize=n=>n>=1073741824?`${(n/1073741824).toFixed(1)} GB`:`${(n/1048576).toFixed(1)} MB`;
-const mediaURL=name=>'/media/'+encodeURIComponent(name);
+const mediaURL=name=>'/media/'+((overview.timelapses||[]).find(item=>item.name===name)?.media_path||name).split('/').map(encodeURIComponent).join('/');
 const active=()=>overview.tasks.find(t=>t.status==='running');
 const signature=day=>day?`${day.events}:${day.ready}:${day.scan_status}:${day.timelapse_count}`:'';
 
@@ -38,7 +38,7 @@ async function api(url,opts={}){
 function notify(error){$('#notice').textContent=error.name==='AbortError'?'服务暂未响应，保留当前内容，稍后自动重试。':error.message||error}
 
 function renderMission(){
-  const run=active(),p=run?.progress||{},d=overview.diagnostics||{};
+  const run=active(),p=run?.progress||{},d=overview.index_progress||overview.diagnostics||{};
   $('#mission').classList.toggle('empty',!run);
   $('#missionTitle').textContent=run?`${run.kind==='export'?(p.phase==='encoding'?'正在拼接已保存片段':'正在合成延时视频'):'正在扫描人物'} · ${fmt(run.date)}${run.dates?.length>1?' — '+fmt(run.dates.at(-1)):''}${run.camera?' · '+cameraLabel(run.camera):''}`:overview.queue_paused?'队列已暂停':overview.indexing?'正在建立录像索引':'当前没有运行中的任务';
   $('#missionBar').style.width=`${run?Math.max(0,Math.min(100,p.percent||0)):0}%`;
@@ -166,9 +166,31 @@ async function retry(id){await api('/api/tasks/'+id+'/retry',{method:'POST'});aw
 async function retryPlan(id){const plan=overview.plans.find(plan=>plan.id===id);if(!plan)return;for(const taskId of plan.retry_ids)await api('/api/tasks/'+taskId+'/retry',{method:'POST'});notify('未完成项已重新排队，成功处理的文件会自动跳过。');await load(true)}
 async function cancel(id){if(!confirm('确定取消该任务吗？已完成的结果会保留。'))return;await api('/api/tasks/'+id,{method:'DELETE'});await load(true)}
 
+function directoryMessage(value){$('#directoryNotice').textContent=value.message||value}
+async function openDirectories(){
+  $('#directoryDialog').showModal();directoryMessage('正在读取目录设置…');
+  try{const data=await api('/api/directories');
+    $('#scanDirectory').value=data.input_root;$('#exportDirectory').value=data.export_root;
+    for(const [kind,roots] of [['scan',data.scan_roots],['export',data.export_roots]])setContent('#'+kind+'Mounts',roots.map(root=>`<button type="button" data-directory-root="${esc(root.path)}" data-directory-kind="${kind}" ${root.available?'':'disabled'}>${esc(root.path)}${root.available?'':' · 未挂载'}</button>`).join(''));
+    $('#stateDirectory').textContent=data.state_root+' · 队列 / 人物索引 / 缩略图 / 片段缓存';
+    const d=data.diagnostics||{};$('#directoryDiagnostics').textContent=`${data.indexing?'正在建立索引。':d.available?`当前索引：${d.mp4_files||0} 个 MP4，${d.recognized_files||0} 个文件名可识别。`:'尚无可用录像索引。'} ${d.scanned_at?'最近完成：'+new Date(d.scanned_at).toLocaleString('zh-CN',{hour12:false})+'。 ':''}${data.settings_error||d.message||''}`;
+    $('#directoryBrowser').hidden=true;directoryMessage('修改目录需等待索引与队列空闲；已保存的文件不会迁移。');
+  }catch(error){directoryMessage(error)}
+}
+async function browseDirectory(kind,path){
+  try{const input=kind==='scan'?'#scanDirectory':'#exportDirectory',data=await api('/api/directories/browse?kind='+kind+'&path='+encodeURIComponent(path||$(input).value));
+    $(input).value=data.path;$('#directoryBrowser').hidden=false;
+    setContent('#directoryBrowser',`<b>${esc(data.path)}</b><button type="button" data-directory-up="${esc(data.path)}" data-directory-kind="${kind}">↑ 上一级（仅限挂载范围）</button>${data.children.map(child=>`<button type="button" data-directory-root="${esc(child.path)}" data-directory-kind="${kind}">▸ ${esc(child.name)}</button>`).join('')||'<p class="subtle">没有子目录，可使用当前目录。</p>'}${data.truncated?'<p class="subtle">仅列出前 200 个子目录，可直接输入路径。</p>':''}`);
+    directoryMessage('当前路径已填入，点击“保存目录设置”后生效。');
+  }catch(error){directoryMessage(error)}
+}
+
 document.addEventListener('click',event=>{
   const button=event.target.closest('button');if(!button||button.disabled)return;const d=button.dataset;
-  if(d.rangeTarget)setDateTarget(d.rangeTarget);
+  if(d.browseKind)browseDirectory(d.browseKind);
+  else if(d.directoryRoot)browseDirectory(d.directoryKind,d.directoryRoot);
+  else if(d.directoryUp)browseDirectory(d.directoryKind,d.directoryUp.slice(0,d.directoryUp.lastIndexOf('/'))||'/');
+  else if(d.rangeTarget)setDateTarget(d.rangeTarget);
   else if(d.month){viewMonth=d.month;renderCalendar()}
   else if(d.date){$('#'+(rangeTarget==='start'?'dateSelect':'endDate')).value=inputDate(d.date);renderRange();showDate(d.date).catch(notify)}
   else if(d.watch)watch(d.watch);
@@ -184,6 +206,9 @@ for(const id of ['libraryYear','libraryMonth','libraryCamera'])$('#'+id).onchang
 for(const [id,kind] of [['timelapse','timelapse'],['scan','scan'],['export','export']])$('#'+id).onclick=()=>createTask(kind);
 $('#queueToggle').onclick=async()=>{try{await api('/api/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:overview.queue_paused?'resume':'pause'})});await load(true)}catch(error){notify(error)}};
 $('#refreshIndex').onclick=async()=>{try{await api('/api/index',{method:'POST'});notify('已请求在后台检查新增录像。');await load()}catch(error){notify(error)}};
+$('#openDirectories').onclick=openDirectories;$('#closeDirectories').onclick=()=>$('#directoryDialog').close();
+$('#directoryRefresh').onclick=async()=>{try{await api('/api/index',{method:'POST'});directoryMessage('已请求刷新当前扫描目录；输入框内尚未保存的路径不会生效。');await load()}catch(error){directoryMessage(error)}};
+$('#directoryForm').onsubmit=async event=>{event.preventDefault();$('#saveDirectories').disabled=true;directoryMessage('正在检查目录与权限…');try{await api('/api/directories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_root:$('#scanDirectory').value.trim(),export_root:$('#exportDirectory').value.trim()})});directoryMessage('已保存。后台正在更新索引，旧成片与任务记录已保留。');await load()}catch(error){directoryMessage(error)}finally{$('#saveDirectories').disabled=false}};
 $('#closePlayer').onclick=()=>$('#player').close();$('#player').addEventListener('close',()=>{$('#playerVideo').pause();$('#playerVideo').removeAttribute('src');$('#playerVideo').load()});
 setDateTarget('start');load();setInterval(()=>load(true),2000);setInterval(()=>load(),20000);
 setInterval(()=>{const run=active();if(run)$('#elapsed').textContent=`${time(elapsed(run,run.progress))} 已运行`;$('#clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false})},1000);

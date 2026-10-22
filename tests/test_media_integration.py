@@ -166,6 +166,32 @@ class MediaIntegrationTests(unittest.TestCase):
         exact = P.decode_export_frames(file, 1.1, .5, 3, lambda: None, mode="accurate")
         self.assertEqual(len(exact), 3)
 
+    def test_fractional_hevc_tail_is_recovered_without_padding_past_eof(self):
+        file = self.root / "0_20000101000000_20000101000004.mp4"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=160x96:rate=20:duration=3.03", "-c:v", "libx265", "-preset", "ultrafast",
+                        "-x265-params", "keyint=40:min-keyint=40:scenecut=0:pools=1:frame-threads=1:log-level=error",
+                        "-pix_fmt", "yuv420p", str(file)], check=True, capture_output=True, timeout=30)
+        self.assertAlmostEqual(P.probe_video_duration(file), 3.05, places=2)
+        for mode in ("keyframes", "accurate"):
+            with self.subTest(mode=mode):
+                frames = P.decode_export_frames(file, 3.02, 1, 1, lambda: None, mode=mode)
+                self.assertEqual(len(frames), 1)
+                self.assertEqual(P.decode_export_frames(file, 3.06, 1, 1, lambda: None, mode=mode), [])
+        with patch.object(P, "decode_export_tail", wraps=P.decode_export_tail) as tail:
+            self.assertLess(len(P.decode_export_frames(file, 3.02, 1, 3, lambda: None, mode="accurate")), 3)
+            tail.assert_not_called()
+        record = P.parse_record(file)
+        events = [(record["start"] + timedelta(seconds=3.02), record["start"] + timedelta(seconds=3.04))]
+        self.assertEqual(P.export([record], events, self.output, "0", "20000101", 1, 25), 0)
+        target = self.output / "people-timelapse-0-20000101.mp4"
+        metadata = json.loads(target.with_suffix(".json").read_text())
+        self.assertEqual((metadata["status"], metadata["frames"], metadata["failed_files"]), ("completed", 1, []))
+        self.assertTrue(P.valid_video(target))
+        with patch.object(P, "decode_export_frames", side_effect=AssertionError("complete repaired fragment decoded again")):
+            self.assertEqual(P.export([record], events, self.output, "0", "20000101", 1, 25), 0)
+        self.assertEqual(json.loads(target.with_suffix(".json").read_text())["reused_files"], 1)
+
     def test_scan_hevc_seek_preserves_actual_pts_and_reads_tail(self):
         file = self.root / "scan-hevc.mp4"
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",

@@ -272,7 +272,7 @@ class ReliabilityTests(unittest.TestCase):
         decoder.returncode, decoder.poll.return_value = 0, 0
         with patch.object(P.subprocess, "Popen", return_value=decoder) as popen:
             frames = P.decode_export_frames(Path("sample.mp4"), 115, 1, 2, lambda: None, mode="accurate")
-        command = popen.call_args.args[0]
+        command = popen.call_args_list[0].args[0]
         self.assertLess(command.index("-ss"), command.index("-i"))
         self.assertEqual(len(frames), 1)
 

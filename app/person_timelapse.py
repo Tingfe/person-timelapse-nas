@@ -550,7 +550,7 @@ def decode_export_frames(path, offset, frame_seconds, frame_count, heartbeat, mo
         command += ["-skip_frame", "nokey"]
     command += ["-ss", str(offset), "-i", str(path), "-map", "0:v:0", "-an",
                 "-vf", f"fps=1/{frame_seconds}:start_time=0:round=up:eof_action=pass,scale=1280:-2",
-                "-frames:v", str(frame_count), "-threads", "2", "-c:v", "mjpeg", "-q:v", "3",
+                "-frames:v", str(frame_count), "-threads", "2", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3",
                 "-f", "image2pipe", "pipe:1"]
     started = time.monotonic()
     timeout = float(os.environ.get("EXPORT_DECODE_TIMEOUT_SECONDS", "120"))
@@ -589,7 +589,52 @@ def decode_export_frames(path, offset, frame_seconds, frame_count, heartbeat, mo
         # pictures remain. Decode only that missing tail precisely.
         frames += decode_export_frames(path, offset + len(frames) * frame_seconds,
                                        frame_seconds, frame_count - len(frames), heartbeat, mode="accurate")
+    elif mode == "accurate" and len(frames) == frame_count - 1:
+        tail = decode_export_tail(path, offset + len(frames) * frame_seconds, frame_seconds, heartbeat)
+        if tail is not None:
+            frames.append(tail)
     return frames
+
+
+def decode_export_tail(path, moment, frame_seconds, heartbeat):
+    """Recover one real EOF picture discarded by accurate seek, without padding."""
+    try:
+        duration = probe_video_duration(path, heartbeat)
+        if not 0 < duration - moment <= min(frame_seconds, 1):
+            return None
+        timeout = float(os.environ.get("EXPORT_DECODE_TIMEOUT_SECONDS", "120"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("EXPORT_DECODE_TIMEOUT_SECONDS must be finite and positive")
+        data, errors = scan_media_process([
+            "ffprobe", "-v", "error", "-threads", "2", "-select_streams", "v:0",
+            "-read_intervals", f"{max(0, duration - 2)}%", "-show_frames", "-show_entries",
+            "stream=start_time:frame=best_effort_timestamp_time,duration_time,pkt_duration_time",
+            "-of", "json", str(path)], heartbeat, timeout)
+        metadata = json.loads(data)
+        last = metadata["frames"][-1]
+        start = float(metadata.get("streams", [{}])[0].get("start_time", 0))
+        pts = float(last["best_effort_timestamp_time"])
+        span = float(last.get("duration_time", last.get("pkt_duration_time", 0)))
+        relative = pts - start
+        if (errors.strip() or not all(math.isfinite(value) for value in (start, pts, span))
+                or not 0 < span <= 1 or not 0 <= relative <= moment < relative + span):
+            return None
+        # Seek just before the proven last frame. Keep original PTS and disable
+        # frame-rate conversion so no duplicate/future picture can fill a gap.
+        image, detail = scan_media_process([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-threads", "2", "-copyts",
+            "-ss", str(max(0, relative - .0001)), "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-vf", "scale=1280:-2,settb=AVTB,showinfo=checksum=0", "-frames:v", "1", "-fps_mode", "passthrough",
+            "-threads", "2", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3",
+            "-f", "image2pipe", "pipe:1"], heartbeat, timeout)
+        # showinfo's decimal pts_time is rounded; use integer microseconds.
+        timestamps = re.findall(r"\bn:\s*\d+\s+pts:\s*(-?\d+)\s+pts_time:", detail)
+        if (image.startswith(b"\xff\xd8") and image.endswith(b"\xff\xd9") and timestamps
+                and math.isclose(int(timestamps[0]) / 1000000, pts, abs_tol=.000001, rel_tol=0)):
+            return image
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"tail recovery unconfirmed: {Path(path).name}: {error}", file=sys.stderr, flush=True)
+    return None
 
 
 def probe_video_duration(path, heartbeat=None):
